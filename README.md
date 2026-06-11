@@ -22,6 +22,12 @@ When a command falls into **Tier 3**, a subagent LLM reviews the command with pr
 cp auto-reviewer.ts ~/.pi/agent/extensions/
 ```
 
+### Via npm
+
+```bash
+pi install npm:pi-auto-reviewer
+```
+
 ### Single project
 
 Copy the extension into your project:
