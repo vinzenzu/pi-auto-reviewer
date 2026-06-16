@@ -145,6 +145,26 @@ async function reviewWithLLM(
             "--thinking", "minimal",
         );
 
+        // Optional provider+model override for the reviewer subprocess.
+        // BOTH must be set — when the same model exists in multiple configured
+        // providers (e.g. a subscription provider like opencode-go and a
+        // pay-per-token mirror like openrouter), specifying only the model id
+        // does not disambiguate the provider, which can silently route the
+        // review to the wrong billing tier.
+        //
+        // Example (use subscription + a cheaper model for review):
+        //   PI_REVIEWER_PROVIDER=opencode-go
+        //   PI_REVIEWER_MODEL=some-cheaper-model
+        //
+        // Unset, or only one of the two set = subprocess uses its configured
+        // default (from settings.json: defaultProvider + defaultModel).
+        const reviewerProvider = process.env.PI_REVIEWER_PROVIDER?.trim() || undefined;
+        const reviewerModel = process.env.PI_REVIEWER_MODEL?.trim() || undefined;
+        if (reviewerProvider && reviewerModel) {
+            piArgs.push("--provider", reviewerProvider);
+            piArgs.push("--model", reviewerModel);
+        }
+
         // Pass prompt as a positional argument (same approach as subagent example)
         piArgs.push(prompt);
 
@@ -195,6 +215,7 @@ async function reviewWithLLM(
         // DEBUG: dump full output to fixed temp file for inspection
         const debugPath = path.join(os.tmpdir(), "pi-reviewer-debug.txt");
         let debugContent = `=== DEBUG ${new Date().toISOString()} ===\n`;
+        debugContent += `MODEL: ${reviewerProvider ? `${reviewerProvider}/${reviewerModel}` : "(subprocess default)"}\n`;
         debugContent += `STDOUT (${fullOutput.length} chars):\n${fullOutput}\n\n`;
         debugContent += `STDERR (${capturedStderr.length} chars):\n${capturedStderr || "(empty)"}\n`;
         await fs.promises.writeFile(debugPath, debugContent, { encoding: "utf8" });
