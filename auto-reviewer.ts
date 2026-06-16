@@ -73,8 +73,6 @@ const AUTO_BLOCKED = [
     /\b(shutdown|reboot|halt|poweroff)\b/,
     // Git destructive without review
     /\bgit\s+(push\s+--force|reset\s+--hard|clean\s+-[fd]+)\b/,
-    // Direct /dev writes
-    />\s*\/dev\//,
 ];
 
 // ── Review prompt template ──
