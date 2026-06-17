@@ -1,16 +1,16 @@
 # pi-auto-reviewer
 
-Automatically review bash commands that your pi agent wants to execute - akin to Codex "Auto-review" and Claude Code "auto mode".
+Automatically review shell commands (PowerShell or bash) that your pi agent wants to execute — akin to Codex "Auto-review" and Claude Code "auto mode".
 
 ## How it works
 
-Every bash command the agent wants to run goes through three tiers:
+Every shell command (PowerShell or bash) the agent wants to run goes through three tiers:
 
 | Tier | Action | Examples |
 |------|--------|----------|
 | **1. Auto-permitted** | Runs immediately | `ls`, `cd`, `grep`, `git status`, `npm list`, `echo` |
-| **2. Auto-blocked** | Refused immediately | `rm -rf`, `sudo`, `chmod 777`, `git push --force`, `shutdown` |
-| **3. Needs review** | Sent to a reviewer LLM | `git commit`, `npm install`, `curl`, `mv`, `sed -i`, `cp` |
+| **2. Auto-blocked** | Refused immediately | `rm -rf`, `sudo`, `chmod 777`, `git push --force`, `Remove-Item -Recurse`, `Start-Process -Verb RunAs` |
+| **3. Needs review** | Sent to a reviewer LLM | `git commit`, `npm install`, `curl`, `mv`, `sed -i`, `cp`, `New-Item`, `Set-Content` |
 
 When a command falls into **Tier 3**, a subagent LLM reviews the command with project context and decides ALLOW or BLOCK.
 
@@ -44,19 +44,21 @@ Pi auto-discovers extensions in `.pi/extensions/` when the project is trusted.
 pi -e ./auto-reviewer.ts
 ```
 
+On native Windows PowerShell, use the matching PowerShell copy commands and extension directory paths for your Pi install. The command rules include common PowerShell read-only commands such as `Get-Location`, `Get-ChildItem`, `Get-Content`, and `Test-Path`, plus Windows destructive/elevation patterns such as `Remove-Item -Recurse`, `cmd /c rmdir /s`, and `Start-Process -Verb RunAs`.
+
 ## Usage
 
-Once installed, it works automatically - no configuration required. Every bash command the agent tries to run will be reviewed.
+Once installed, it works automatically — no configuration required. Every shell command the agent tries to run will be reviewed.
 
 ### What to expect
 
 - **Safe commands** (Tier 1) run without any visible delay.
 - **Dangerous commands** (Tier 2) are blocked with a notification explaining why.
-- **Everything else** (Tier 3) pauses briefly while the reviewer LLM decides. You'll see a status message: `Reviewing: <command>...`
+- **Everything else** (Tier 3) pauses while the reviewer LLM decides (up to 60s per attempt, with one automatic retry on failure). You'll see a status message: `Reviewing: <command>...`
 
   - If **allowed**: the command runs and you see `Auto-reviewer: ✓ <reason>`
   - If **blocked**: the command is refused and you see `Auto-reviewer: ✗ <reason>`
-  - If the reviewer **fails** (timeout, error): you're prompted interactively to allow or deny manually.
+  - If the reviewer **fails** on both attempts (timeout, error): you're prompted interactively to allow or deny manually.
 
 ### Non-interactive mode
 
