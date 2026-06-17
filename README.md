@@ -46,7 +46,7 @@ pi -e ./auto-reviewer.ts
 
 ## Usage
 
-Once installed, it works automatically - no configuration needed. Every bash command the agent tries to run will be reviewed.
+Once installed, it works automatically - no configuration required. Every bash command the agent tries to run will be reviewed.
 
 ### What to expect
 
@@ -61,6 +61,27 @@ Once installed, it works automatically - no configuration needed. Every bash com
 ### Non-interactive mode
 
 In print mode (`pi -p`) or JSON mode, Tier 3 commands are blocked by default since there's no UI to fall back on.
+
+## Configuration
+
+By default, Tier 3 review uses your normal pi inference provider and model. You can route reviewer calls to a specific provider and model with environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `PI_REVIEWER_PROVIDER` | Inference provider for the reviewer subprocess, for example `opencode-go` |
+| `PI_REVIEWER_MODEL` | Model for the reviewer subprocess, for example `deepseek-v4-flash` |
+
+Set both variables together:
+
+```bash
+export PI_REVIEWER_PROVIDER=opencode-go
+export PI_REVIEWER_MODEL=deepseek-v4-flash
+pi
+```
+
+`export` only affects the current shell session. To keep these settings across new terminals, add the two `export` lines to your shell startup file, for example `~/.bashrc` on many Linux and WSL setups. Other shells use different files, such as `~/.zshrc` for zsh.
+
+If either variable is missing or empty, the reviewer uses pi's configured default provider and model. This avoids accidentally selecting a model name from the wrong provider when the same model id is available in more than one place.
 
 ## Customizing review rules
 
