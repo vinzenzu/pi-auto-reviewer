@@ -82,7 +82,10 @@ const EMPTY_CONTEXT: ReviewContext = {
     osInfo: "unknown",
 };
 
-async function getRecentShellCommands(sessionManager: SessionManager | undefined): Promise<string[]> {
+async function getRecentShellCommands(
+    sessionManager: SessionManager | undefined,
+    excludeToolCallId?: string,
+): Promise<string[]> {
     if (!sessionManager) return [];
     try {
         const branch = typeof sessionManager.getBranch === "function"
@@ -98,6 +101,17 @@ async function getRecentShellCommands(sessionManager: SessionManager | undefined
             if (!msg) continue;
 
             if (msg.role === "assistant" && Array.isArray(msg.content)) {
+                // The command currently under review lives in the latest assistant message
+                // (pi's session manager is synchronized through the current assistant message
+                // before tool_call handlers run). In parallel tool mode, sibling bash tool
+                // calls in that same message are also pending execution, not history. Skip
+                // the whole message so the reviewer cannot be tricked into thinking a
+                // dangerous command was already executed.
+                if (excludeToolCallId && msg.content.some(
+                    (b: any) => b?.type === "toolCall" && b?.id === excludeToolCallId,
+                )) {
+                    continue;
+                }
                 for (const block of msg.content) {
                     if (block?.type === "toolCall" && block?.name === "bash") {
                         const cmd = block.arguments?.command;
@@ -252,11 +266,12 @@ async function gatherReviewContext(
     cwd: string,
     sessionManager: SessionManager | undefined,
     signal: AbortSignal | undefined,
+    excludeToolCallId?: string,
 ): Promise<ReviewContext> {
     const overallTimer = setTimeout(() => { /* race below */ }, CONTEXT_GATHER_TIMEOUT_MS);
     const work = (async (): Promise<ReviewContext> => {
         const [recentCommands, git, agentsMdSnippet, osInfo] = await Promise.all([
-            getRecentShellCommands(sessionManager),
+            getRecentShellCommands(sessionManager, excludeToolCallId),
             getGitInfo(cwd, signal),
             getAgentsMdSnippet(cwd),
             getOsInfo(),
@@ -729,11 +744,12 @@ async function reviewWithLLM(
     sessionManager: SessionManager | undefined,
     signal: AbortSignal | undefined,
     analysis: BehaviorAnalysis,
+    excludeToolCallId?: string,
 ): Promise<{ allowed: boolean; reason: string }> {
     // Gather context first; the prompt is built from it. Each source is
     // time-bounded and falls back to an empty context on failure so a slow
     // `git status` can never block review indefinitely.
-    const context = await gatherReviewContext(cwd, sessionManager, signal);
+    const context = await gatherReviewContext(cwd, sessionManager, signal, excludeToolCallId);
     const prompt = buildReviewPrompt(command, cwd, context, analysis);
 
     // Write prompt to temp file
@@ -934,7 +950,14 @@ export default function (pi: ExtensionAPI) {
                 if (ctx.hasUI) {
                     ctx.ui.setStatus("auto-reviewer", `Reviewing (attempt ${attempt}/${MAX_REVIEW_ATTEMPTS}): ${command.slice(0, 60)}...`);
                 }
-                const decision = await reviewWithLLM(command, ctx.cwd, ctx.sessionManager, ctx.signal, analysis);
+                const decision = await reviewWithLLM(
+                    command,
+                    ctx.cwd,
+                    ctx.sessionManager,
+                    ctx.signal,
+                    analysis,
+                    event.toolCallId,
+                );
 
                 if (ctx.hasUI) ctx.ui.setStatus("auto-reviewer", undefined);
 
