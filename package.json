@@ -1,6 +1,6 @@
 {
   "name": "pi-auto-reviewer",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Auto-review bash commands before your pi agent executes them — akin to Codex Auto-review and Claude Code auto mode.",
   "keywords": [
     "pi-package"
