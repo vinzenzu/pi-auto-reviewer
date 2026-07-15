@@ -119,14 +119,32 @@ In print mode (`pi -p`) or JSON mode, reviewed commands are still sent to the re
 
 ## Configuration
 
-By default, reviewed commands use your normal pi inference provider and model. You can route reviewer calls to a specific provider and model with environment variables:
+By default, reviewed commands use your normal pi inference provider and model. You can route reviewer calls to a specific provider and model with `autoReviewer` in either a project or user `settings.json`:
+
+```json
+{
+  "autoReviewer": {
+    "provider": "main",
+    "model": "codex-auto-review"
+  }
+}
+```
+
+Supported locations are:
+
+- Project: `.pi/settings.json`
+- User: `~/.pi/agent/settings.json`
+
+The resolution order is environment variables, project settings, user settings, then Pi's normal default provider/model. Environment variables override settings independently:
 
 | Variable | Purpose |
 |----------|---------|
 | `PI_REVIEWER_PROVIDER` | Inference provider for the reviewer subprocess, for example `opencode-go` |
 | `PI_REVIEWER_MODEL` | Model for the reviewer subprocess, for example `deepseek-v4-flash` |
 
-Set both provider/model variables together:
+Set both provider/model values together in settings or through environment variables. If either value is missing or empty after resolution, no explicit override is passed and the reviewer uses Pi's configured default provider and model.
+
+You can also route reviewer calls with environment variables:
 
 ```bash
 export PI_REVIEWER_PROVIDER=opencode-go

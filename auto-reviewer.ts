@@ -48,6 +48,46 @@ const CONTEXT_GATHER_TIMEOUT_MS = 3000;
 const REVIEW_TIMEOUT_MS = 60000;
 const MAX_REVIEW_ATTEMPTS = 2;
 
+interface ReviewerSettings {
+    provider?: string;
+    model?: string;
+}
+
+// Read the extension-specific reviewer overrides without making malformed
+// project or user settings block command review.
+function readReviewerSettingsFile(filePath: string): ReviewerSettings {
+    try {
+        const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+        if (!parsed || typeof parsed !== "object") return {};
+        const value = (parsed as Record<string, unknown>).autoReviewer;
+        if (!value || typeof value !== "object") return {};
+        const config = value as Record<string, unknown>;
+        return {
+            provider: typeof config.provider === "string" ? config.provider.trim() || undefined : undefined,
+            model: typeof config.model === "string" ? config.model.trim() || undefined : undefined,
+        };
+    } catch {
+        return {};
+    }
+}
+
+function getReviewerSettings(cwd: string): ReviewerSettings {
+    const project = readReviewerSettingsFile(path.join(cwd, ".pi", "settings.json"));
+    const user = readReviewerSettingsFile(path.join(os.homedir(), ".pi", "agent", "settings.json"));
+    // Project settings take precedence over the user-level fallback per field.
+    return { provider: project.provider ?? user.provider, model: project.model ?? user.model };
+}
+
+function resolveReviewerModel(cwd: string): ReviewerSettings {
+    const settings = getReviewerSettings(cwd);
+    // Environment variables override each setting independently, while an
+    // unset variable falls back to the project/user configuration.
+    return {
+        provider: process.env.PI_REVIEWER_PROVIDER?.trim() || settings.provider,
+        model: process.env.PI_REVIEWER_MODEL?.trim() || settings.model,
+    };
+}
+
 // ── Small helpers ──
 function stripAnsiAndControl(input: string): string {
     // Strip ANSI escape codes and most control characters, keep newlines/tabs.
@@ -976,14 +1016,13 @@ async function reviewWithLLM(
         // does not disambiguate the provider, which can silently route the
         // review to the wrong billing tier.
         //
-        // Example (use subscription + a cheaper model for review):
-        //   PI_REVIEWER_PROVIDER=opencode-go
-        //   PI_REVIEWER_MODEL=some-cheaper-model
+        // Example for this fork:
+        //   PI_REVIEWER_PROVIDER=main
+        //   PI_REVIEWER_MODEL=codex-auto-review
         //
         // Unset, or only one of the two set = subprocess uses its configured
         // default (from settings.json: defaultProvider + defaultModel).
-        const reviewerProvider = process.env.PI_REVIEWER_PROVIDER?.trim() || undefined;
-        const reviewerModel = process.env.PI_REVIEWER_MODEL?.trim() || undefined;
+        const { provider: reviewerProvider, model: reviewerModel } = resolveReviewerModel(cwd);
         if (reviewerProvider && reviewerModel) {
             piArgs.push("--provider", reviewerProvider);
             piArgs.push("--model", reviewerModel);
