@@ -6,6 +6,16 @@
     "pi-package"
   ],
   "license": "MIT",
+  
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vinzenzu/pi-auto-reviewer.git"
+  },
+  "homepage": "https://github.com/vinzenzu/pi-auto-reviewer#readme",
+  "bugs": {
+    "url": "https://github.com/vinzenzu/pi-auto-reviewer/issues"
+  },
+  
   "pi": {
     "extensions": [
       "./auto-reviewer.ts"
