@@ -67,13 +67,24 @@ Tool results, tool-call arguments, thinking blocks, and session summaries are **
 
 The reviewer's rule for this is: **user authorization leans ALLOW, but it does not override the hard rules** — still BLOCK if the command exfiltrates secrets/credentials to an untrusted destination, pipes remote content to a shell, causes irreversible destruction outside the project, or persistently weakens security.
 
+### Decision extraction
+
+The reviewer's verdict is extracted through two channels:
+
+1. **`submit_review` tool (primary).** The reviewer subprocess is loaded with a `submit_review` tool (see `review-tool.ts`), and the verdict arrives as schema-validated tool-call arguments — immune to chain-of-thought leaking into the text channel.
+2. **Text parsing (fallback).** For models that ignore the tool, `ALLOW:`/`BLOCK:` lines are parsed tolerantly: code fences are stripped, and a verdict prefixed by leaked reasoning (e.g. `...SafeALLOW: reason`) still matches. A response containing **both** ALLOW and BLOCK is treated as a parse error and retried — an ambiguous review never silently becomes an ALLOW.
+
+If a response can't be parsed, the review is retried once with a coercion notice; if it still fails, the command is blocked (or you're prompted manually in interactive mode) with an error that names exactly what was wrong and where the full reviewer output was logged. Each attempt writes a debug file to `/tmp/pi-reviewer-debug/<timestamp>-attempt<N>.txt` (newest 20 are kept).
+
 ## Install
 
 ### All projects (global)
 
 ```bash
-cp auto-reviewer.ts ~/.pi/agent/extensions/
+cp auto-reviewer.ts review-tool.ts ~/.pi/agent/extensions/pi-auto-reviewer/
 ```
+
+(Both files must sit side by side — `review-tool.ts` provides the structured decision channel. If it's missing, the reviewer falls back to text parsing only.)
 
 ### Via npm
 
@@ -86,7 +97,7 @@ pi install npm:pi-auto-reviewer
 Copy the extension into your project:
 
 ```bash
-cp auto-reviewer.ts .pi/extensions/
+cp auto-reviewer.ts review-tool.ts .pi/extensions/
 ```
 
 Pi auto-discovers extensions in `.pi/extensions/` when the project is trusted.
@@ -119,14 +130,32 @@ In print mode (`pi -p`) or JSON mode, reviewed commands are still sent to the re
 
 ## Configuration
 
-By default, reviewed commands use your normal pi inference provider and model. You can route reviewer calls to a specific provider and model with environment variables:
+By default, reviewed commands use your normal pi inference provider and model. You can route reviewer calls to a specific provider and model with environment variables or settings files:
 
 | Variable | Purpose |
 |----------|---------|
 | `PI_REVIEWER_PROVIDER` | Inference provider for the reviewer subprocess, for example `opencode-go` |
 | `PI_REVIEWER_MODEL` | Model for the reviewer subprocess, for example `deepseek-v4-flash` |
 
-Set both provider/model variables together:
+Persistent configuration goes in an `autoReviewer` object in a pi `settings.json`:
+
+```json
+{
+  "autoReviewer": {
+    "provider": "opencode-go",
+    "model": "deepseek-v4-flash"
+  }
+}
+```
+
+Supported locations:
+
+- User: `~/.pi/agent/settings.json`
+- Project: `.pi/settings.json` — honored only when the project is trusted
+
+Provider and model are resolved **as a pair**: env pair → trusted project pair → user pair → pi's default. A layer that specifies only one of the two is ignored entirely — mixing a provider from one layer with a model from another could silently route reviews to the wrong provider or billing tier.
+
+Environment variables for a temporary override:
 
 ```bash
 export PI_REVIEWER_PROVIDER=opencode-go
@@ -134,10 +163,14 @@ export PI_REVIEWER_MODEL=deepseek-v4-flash
 pi
 ```
 
-`export` only affects the current shell session. To keep these settings across new terminals, add the `export` lines to your shell startup file, for example `~/.bashrc` on many Linux and WSL setups. Other shells use different files, such as `~/.zshrc` for zsh.
+`export` only affects the current shell session. To keep these settings across new terminals, use the settings file above or add the `export` lines to your shell startup file, for example `~/.bashrc` on many Linux and WSL setups. Other shells use different files, such as `~/.zshrc` for zsh.
 
-If either `PI_REVIEWER_PROVIDER` or `PI_REVIEWER_MODEL` is missing or empty, the reviewer uses pi's configured default provider and model. This avoids accidentally selecting a model name from the wrong provider when the same model id is available in more than one place.
+If no complete pair resolves, the reviewer uses pi's configured default provider and model.
 
 ## Customizing review rules
 
 Edit `AUTO_PERMITTED` and `AUTO_BLOCKED` arrays in `auto-reviewer.ts` to add or remove patterns. Tune `defeatsAutoPermit()` and the `SECRET_ENV_VAR` pattern to change which shell metacharacters / secret-looking variables force a read-only-looking command through to LLM review. Edit `getConversationContext()` and its `MAX_*_LEN` / `*_LIMIT` constants to change how much of the conversation history the reviewer sees. Edit `buildReviewPrompt()` and the behavior analyzer (`analyzeCommand` and helpers) to change how commands are classified and what the reviewer LLM sees.
+
+---
+
+The ability to configure reviewer provider/model via `autoReviewer` in `settings.json` is based on [PR #2](https://github.com/vinzenzu/pi-auto-reviewer/pull/2) by [JiChenSSG](https://github.com/JiChenSSG).
