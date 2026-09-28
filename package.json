@@ -1,12 +1,11 @@
 {
   "name": "pi-auto-reviewer",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Auto-review bash commands before your pi agent executes them — akin to Codex Auto-review and Claude Code auto mode.",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
-  
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vinzenzu/pi-auto-reviewer.git"
@@ -15,7 +14,6 @@
   "bugs": {
     "url": "https://github.com/vinzenzu/pi-auto-reviewer/issues"
   },
-  
   "pi": {
     "extensions": [
       "./auto-reviewer.ts"
