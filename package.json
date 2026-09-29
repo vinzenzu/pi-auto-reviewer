@@ -19,6 +19,9 @@
       "./auto-reviewer.ts"
     ]
   },
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/*.test.ts"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   }

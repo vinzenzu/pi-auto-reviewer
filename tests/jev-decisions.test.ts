@@ -137,3 +137,15 @@ test("the HTTP driver interoperates with a compatible server and refuses redirec
         await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
 });
+
+
+test("billing survives an invalid verdict and observer errors cannot change a valid verdict", async () => {
+    const bills: any[] = [];
+    await assert.rejects(requestJevReview({ provider: "openrouter", model: "typesafe/jev" }, "state", 1000, undefined, "key",
+        async () => Response.json({ id: "gen-billed-invalid", usage: { cost: 0.002 }, answers: {} }),
+        bill => bills.push(bill)), /invalid/);
+    assert.deepEqual(bills, [{ provider: "openrouter", responseId: "gen-billed-invalid", model: "typesafe/jev", costUSD: 0.002 }]);
+    const result = await requestJevReview(config, "state", 1000, undefined, "key", async () => response(),
+        () => { throw new Error("consumer error"); });
+    assert.equal(result.decision.allowed, true);
+});

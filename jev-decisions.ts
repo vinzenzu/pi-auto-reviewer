@@ -11,6 +11,13 @@ const PROVIDER_ENDPOINTS: Record<string, string> = {
     openrouter: "https://openrouter.ai/api/alpha/decisions",
 };
 
+export interface JevCharge {
+    provider?: string;
+    responseId?: string;
+    model?: string;
+    costUSD?: unknown;
+}
+
 export type JevCredentialResolver = (provider: string) => Promise<string | undefined>;
 
 function getEndpoint(config: JevConfig): URL {
@@ -106,6 +113,7 @@ export async function requestJevReview(
     signal: AbortSignal | undefined,
     apiKey: string,
     fetchImpl: typeof fetch = fetch,
+    onCharge?: (charge: JevCharge) => void,
 ): Promise<{ decision: { allowed: boolean; reason: string }; fullOutput: string }> {
     const endpoint = getEndpoint(config).href;
     if (!config.model) throw new Error("Jev requires a model");
@@ -140,6 +148,13 @@ export async function requestJevReview(
     } catch {
         throw new Error("Jev returned invalid JSON");
     }
+    const result = asRecord(data);
+    try {
+        onCharge?.({ provider: config.provider,
+            responseId: typeof result.id === "string" ? result.id : undefined,
+            model: typeof result.model === "string" ? result.model : config.model,
+            costUSD: asRecord(result.usage).cost });
+    } catch { /* Billing consumers cannot change the decision. */ }
     const answer = asRecord(asRecord(asRecord(data).answers).command_review);
     const probabilities = asRecord(answer.probabilities);
     if (answer.type !== "choice" || typeof answer.choice !== "string" || !Object.hasOwn(CRITERIA, answer.choice) ||

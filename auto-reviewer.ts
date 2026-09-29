@@ -27,8 +27,9 @@
  * falling back to a conservative block / manual prompt.
  */
 
-import { requestJevReview, resolveJevApiKey, type JevConfig } from "./jev-decisions.ts";
+import { requestJevReview, resolveJevApiKey, type JevConfig, type JevCharge } from "./jev-decisions.ts";
 import { spawn } from "node:child_process";
+import { ReviewerCosts, ReviewerOutput, REVIEWER_COST_ENTRY, REVIEWER_COST_EVENT, REVIEWER_USAGE_KIND, formatReviewerCost } from "./reviewer-cost.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1200,6 +1201,8 @@ async function reviewWithLLM(
     attempt: number,
     projectTrusted: boolean,
     modelRegistry: ExtensionContext["modelRegistry"],
+    onBillingResponse: (message: unknown) => void,
+    onCharge: (charge: JevCharge) => void,
 ): Promise<{ allowed: boolean; reason: string }> {
     // Gather context first; the prompt is built from it. Each source is
     // time-bounded and falls back to an empty context on failure so a slow
@@ -1220,7 +1223,7 @@ async function reviewWithLLM(
             const apiKey = await resolveJevApiKey(
                 overrides, provider => modelRegistry.getApiKeyForProvider(provider), process.env, reviewSignal,
             );
-            result = await requestJevReview(overrides, prompt, REVIEW_TIMEOUT_MS, reviewSignal, apiKey);
+            result = await requestJevReview(overrides, prompt, REVIEW_TIMEOUT_MS, reviewSignal, apiKey, fetch, onCharge);
         } catch (error) {
             const detail = error instanceof Error ? error.message : "Jev review failed";
             await writeDebugFile({
@@ -1305,6 +1308,7 @@ async function reviewWithLLM(
         piArgs.push(prompt);
 
         let capturedStderr = "";
+        const billingOutput = new ReviewerOutput(onBillingResponse);
 
         const fullOutput = await new Promise<string>((resolve, reject) => {
             const proc = spawn(piCmd, piArgs, {
@@ -1315,7 +1319,10 @@ async function reviewWithLLM(
 
             let stdout = "";
 
-            proc.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
+            proc.stdout.on("data", (data: Buffer) => {
+                stdout += data.toString();
+                billingOutput.write(data);
+            });
             proc.stderr.on("data", (data: Buffer) => { capturedStderr += data.toString(); });
 
             const timeout = setTimeout(() => {
@@ -1324,6 +1331,7 @@ async function reviewWithLLM(
             }, REVIEW_TIMEOUT_MS);
 
             proc.on("close", (code) => {
+                billingOutput.end();
                 clearTimeout(timeout);
                 if (code === 0 || code === null) {
                     resolve(stdout.trim());
@@ -1379,6 +1387,13 @@ async function reviewWithLLM(
 }
 
 export default function (pi: ExtensionAPI) {
+    let activeSessionId: string | undefined;
+    const billingTrackers = new Set<ReviewerCosts>();
+    pi.on("session_start", (_event, ctx) => {
+        for (const tracker of billingTrackers) tracker.dispose();
+        billingTrackers.clear();
+        activeSessionId = ctx.sessionManager.getSessionId();
+    });
     pi.on("tool_call", async (event, ctx) => {
         if (event.toolName !== "bash") return undefined;
 
@@ -1408,6 +1423,42 @@ export default function (pi: ExtensionAPI) {
 
         let lastError: Error | null = null;
         const projectTrusted = ctx.isProjectTrusted();
+        const parentSessionId = ctx.sessionManager.getSessionId();
+        let resultLabel: string | undefined;
+        let resultLevel: "info" | "warning" = "info";
+        let shownCost: string | undefined;
+        const costs = new ReviewerCosts({
+            parentSessionId, reviewId: event.toolCallId,
+            getApiKey: () => ctx.modelRegistry.getApiKeyForProvider("openrouter"),
+            report: cost => {
+                if (activeSessionId !== parentSessionId) return;
+                if (cost.status === "confirmed") {
+                    // Pi 0.87.1 exposes the public SessionManager at runtime.
+                    // Cost-only usage preserves token counts and survives reloads.
+                    const manager = ctx.sessionManager as SessionManager;
+                    manager.appendUsage(REVIEWER_USAGE_KIND, cost.provider, cost.model ?? "unknown", {
+                        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost.costUSD! },
+                    }, cost.responseId);
+                }
+                pi.appendEntry(REVIEWER_COST_ENTRY, cost);
+                pi.events.emit(REVIEWER_COST_EVENT, cost);
+                const label = formatReviewerCost(costs.summary());
+                if (ctx.hasUI && resultLabel && label !== shownCost) {
+                    shownCost = label;
+                    ctx.ui.notify(`${resultLabel} · ${label}`, resultLevel);
+                }
+                if (resultLabel && costs.summary().pending === 0) billingTrackers.delete(costs);
+            },
+        });
+        billingTrackers.add(costs);
+        const showResult = (label: string, level: "info" | "warning") => {
+            resultLabel = label;
+            resultLevel = level;
+            shownCost = formatReviewerCost(costs.summary());
+            if (ctx.hasUI) ctx.ui.notify(label + (shownCost ? ` · ${shownCost}` : ""), level);
+            if (costs.summary().pending === 0) billingTrackers.delete(costs);
+        };
 
         for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
             try {
@@ -1424,15 +1475,17 @@ export default function (pi: ExtensionAPI) {
                     attempt,
                     projectTrusted,
                     ctx.modelRegistry,
+                    message => costs.observe(message),
+                    charge => costs.observeCharge(charge),
                 );
 
                 if (ctx.hasUI) ctx.ui.setStatus("auto-reviewer", undefined);
 
                 if (decision.allowed) {
-                    if (ctx.hasUI) ctx.ui.notify(`Auto-reviewer: ✓ ${decision.reason}`, "info");
+                    showResult(`Auto-reviewer: ✓ ${decision.reason}`, "info");
                     return undefined; // allow through
                 } else {
-                    if (ctx.hasUI) ctx.ui.notify(`Auto-reviewer: ✗ ${decision.reason}`, "warning");
+                    showResult(`Auto-reviewer: ✗ ${decision.reason}`, "warning");
                     return { block: true, reason: `Auto-reviewer blocked: ${decision.reason}` };
                 }
             } catch (err) {
@@ -1444,6 +1497,8 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (ctx.hasUI) ctx.ui.setStatus("auto-reviewer", undefined);
+
+        showResult(`Auto-reviewer failed: ${lastError!.message.split("\n")[0].slice(0, 150)}`, "warning");
 
         if (ctx.hasUI) {
             // All attempts failed — fall back to manual UI
@@ -1463,6 +1518,8 @@ export default function (pi: ExtensionAPI) {
 
     // Clean up status on session end
     pi.on("session_shutdown", async (_event, _ctx) => {
-        // No cleanup needed; status is session-scoped
+        for (const tracker of billingTrackers) tracker.dispose();
+        billingTrackers.clear();
+        activeSessionId = undefined;
     });
 }
