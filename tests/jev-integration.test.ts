@@ -58,7 +58,7 @@ function install(t: any, cwd: string, getProviderApiKey = async (_provider: stri
     return command => handler({ toolName: "bash", input: { command }, toolCallId: "pending" }, {
         cwd, hasUI: false, isProjectTrusted: () => false,
         modelRegistry: { getApiKeyForProvider: getProviderApiKey },
-        sessionManager: { getBranch: () => [{ message: { role: "user", content: "Please run the project tests." } }] },
+        sessionManager: { getSessionId: () => "test-session", appendUsage() {}, getBranch: () => [{ message: { role: "user", content: "Please run the project tests." } }] },
     });
 }
 

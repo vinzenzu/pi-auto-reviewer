@@ -47,7 +47,7 @@ These behaviors are included in the reviewer prompt:
 Global (all projects):
 
 ```bash
-cp auto-reviewer.ts review-tool.ts jev-decisions.ts ~/.pi/agent/extensions/pi-auto-reviewer/
+cp auto-reviewer.ts review-tool.ts jev-decisions.ts reviewer-cost.ts ~/.pi/agent/extensions/pi-auto-reviewer/
 ```
 
 Via npm:
@@ -59,7 +59,7 @@ pi install npm:pi-auto-reviewer
 Single project:
 
 ```bash
-cp auto-reviewer.ts review-tool.ts jev-decisions.ts .pi/extensions/
+cp auto-reviewer.ts review-tool.ts jev-decisions.ts reviewer-cost.ts .pi/extensions/
 ```
 
 Pi loads extensions from `.pi/extensions/` only after the project is trusted.
@@ -70,7 +70,7 @@ Single session:
 pi -e ./auto-reviewer.ts
 ```
 
-All three `.ts` files must sit side by side. `jev-decisions.ts` provides the Jev HTTP driver. For the pi backend, `review-tool.ts` provides the structured decision channel; without it the reviewer falls back to text parsing only. On Windows PowerShell, use the matching copy commands and extension paths.
+All four `.ts` files must sit side by side. `jev-decisions.ts` provides the Jev HTTP driver. For the pi backend, `review-tool.ts` provides the structured decision channel; without it the reviewer falls back to text parsing only. On Windows PowerShell, use the matching copy commands and extension paths.
 
 ## Usage
 
@@ -170,3 +170,52 @@ Edit `auto-reviewer.ts`: `AUTO_PERMITTED` / `AUTO_BLOCKED` for tier patterns, `d
 ---
 
 The `autoReviewer` settings support is based on [PR #2](https://github.com/vinzenzu/pi-auto-reviewer/pull/2) by [JiChenSSG](https://github.com/JiChenSSG).
+
+## OpenRouter review costs
+
+Review results show the provider-confirmed charge, for example
+`Auto-reviewer: ✓ Read-only check · OpenRouter $0.003072`. Billing lookups run in the
+background. The result shows pending costs first when needed, followed by an
+updated notification once OpenRouter reports them. Billing never changes the
+allow/block decision or delays command execution. Confirmed review charges also
+enter pi's native cost totals and breakdown through persisted, cost-only usage
+entries. This works without any other extension and leaves token counts intact.
+Billing currently supports OpenRouter only. Reviews through other providers
+show no cost label and emit no OpenRouter billing events.
+
+Tested only with pi 0.87.1.
+
+Uses pi's saved OpenRouter credential. The pi backend looks up generation charges;
+the Jev backend uses OpenRouter's returned `usage.cost`, including billed attempts
+with invalid verdicts, without a second lookup when that charge is available.
+Each generation is counted once, including
+failed review attempts and IDs observed before a subprocess was killed. Missing
+IDs, credentials or billing records stay visibly unavailable. Lookups retry six
+times, with a five-second timeout and at most three concurrent lookups per review.
+If a process exits before billing settles, its saved pending IDs can be
+reconciled by a cost-extension consumer on resume. No spending cap is added.
+
+Public integration: subscribe to `pi-auto-reviewer:cost` through `pi.events.on`.
+Payload type `ReviewerCostEvent` is exported from `reviewer-cost.ts`:
+
+```typescript
+{
+  parentSessionId: string; // accounting owner, not an OpenRouter routing setting
+  reviewId: string;       // shell tool-call ID
+  provider: "openrouter";
+  responseId: string;
+  model?: string;
+  status: "pending" | "confirmed" | "unavailable";
+  costUSD?: number;       // present only when confirmed; zero is valid
+}
+```
+
+The same payload is persisted in custom entries named `pi-auto-reviewer-cost`,
+outside the model context. Consumers should deduplicate by response ID and use
+the confirmed `costUSD`; they do not need to issue a second billing lookup.
+The package has no dependency on a particular cost extension or local path.
+This feature does not change reviewer session IDs or provider routing.
+
+For source tests, use Node.js 24, run `npm install` to resolve the pi peer
+dependency, then `npm test`. Tests use fake credentials and mocked provider
+responses, plus a local HTTP fixture; they do not issue paid model requests.
