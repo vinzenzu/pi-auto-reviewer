@@ -147,6 +147,38 @@ export function resolveReviewerOverrides(
     return {};
 }
 
+export function resolveNotifyOnAllow(
+    cwd: string,
+    isProjectTrusted: boolean,
+    env: NodeJS.ProcessEnv = process.env,
+    homeDir: string = os.homedir(),
+): boolean {
+    if (env.PI_REVIEWER_NOTIFY_ON_ALLOW !== undefined) {
+        return env.PI_REVIEWER_NOTIFY_ON_ALLOW === "true" || env.PI_REVIEWER_NOTIFY_ON_ALLOW === "1";
+    }
+    if (isProjectTrusted) {
+        try {
+            const projectSettings = path.join(cwd, CONFIG_DIR_NAME, "settings.json");
+            if (fs.existsSync(projectSettings)) {
+                const parsed = JSON.parse(fs.readFileSync(projectSettings, "utf8"));
+                if (typeof parsed?.autoReviewer?.notifyOnAllow === "boolean") {
+                    return parsed.autoReviewer.notifyOnAllow;
+                }
+            }
+        } catch {}
+    }
+    try {
+        const userSettings = path.join(homeDir, ".pi", "agent", "settings.json");
+        if (fs.existsSync(userSettings)) {
+            const parsed = JSON.parse(fs.readFileSync(userSettings, "utf8"));
+            if (typeof parsed?.autoReviewer?.notifyOnAllow === "boolean") {
+                return parsed.autoReviewer.notifyOnAllow;
+            }
+        }
+    } catch {}
+    return false;
+}
+
 // ── Small helpers ──
 function stripAnsiAndControl(input: string): string {
     // Strip ANSI escape codes and most control characters, keep newlines/tabs.
@@ -1423,10 +1455,13 @@ export default function (pi: ExtensionAPI) {
 
         let lastError: Error | null = null;
         const projectTrusted = ctx.isProjectTrusted();
+        const notifyOnAllow = resolveNotifyOnAllow(ctx.cwd, projectTrusted);
         const parentSessionId = ctx.sessionManager.getSessionId();
         let resultLabel: string | undefined;
         let resultLevel: "info" | "warning" = "info";
         let shownCost: string | undefined;
+        let reviewCompleted = false;
+        let shouldNotifyResult = false;
         const costs = new ReviewerCosts({
             parentSessionId, reviewId: event.toolCallId,
             getApiKey: () => ctx.modelRegistry.getApiKeyForProvider("openrouter"),
@@ -1444,19 +1479,21 @@ export default function (pi: ExtensionAPI) {
                 pi.appendEntry(REVIEWER_COST_ENTRY, cost);
                 pi.events.emit(REVIEWER_COST_EVENT, cost);
                 const label = formatReviewerCost(costs.summary());
-                if (ctx.hasUI && resultLabel && label !== shownCost) {
+                if (ctx.hasUI && shouldNotifyResult && resultLabel && label !== shownCost) {
                     shownCost = label;
                     ctx.ui.notify(`${resultLabel} · ${label}`, resultLevel);
                 }
-                if (resultLabel && costs.summary().pending === 0) billingTrackers.delete(costs);
+                if (reviewCompleted && costs.summary().pending === 0) billingTrackers.delete(costs);
             },
         });
         billingTrackers.add(costs);
         const showResult = (label: string, level: "info" | "warning") => {
+            reviewCompleted = true;
             resultLabel = label;
             resultLevel = level;
             shownCost = formatReviewerCost(costs.summary());
-            if (ctx.hasUI) ctx.ui.notify(label + (shownCost ? ` · ${shownCost}` : ""), level);
+            shouldNotifyResult = level === "warning" || notifyOnAllow;
+            if (ctx.hasUI && shouldNotifyResult) ctx.ui.notify(label + (shownCost ? ` · ${shownCost}` : ""), level);
             if (costs.summary().pending === 0) billingTrackers.delete(costs);
         };
 

@@ -79,7 +79,7 @@ Works automatically, no configuration required.
 - Tier 1 runs without visible delay.
 - Tier 2 is blocked with a notification explaining why.
 - Tier 3 handles destructive or unknown commands and pauses with `Reviewing: <command>...` (up to 60s per attempt, one automatic retry).
-  - Allowed: command runs, `Auto-reviewer: ✓ <reason>`
+  - Allowed: command runs quietly without toast notification clutter (enable `notifyOnAllow` to display `Auto-reviewer: ✓ <reason>`)
   - Blocked: command refused, `Auto-reviewer: ✗ <reason>`
   - Reviewer failed twice: interactive mode prompts you manually; non-interactive mode (`pi -p`, JSON mode) blocks the command.
 
