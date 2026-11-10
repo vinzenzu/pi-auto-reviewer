@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolveReviewerOverrides } from "../auto-reviewer.ts";
+import { resolveReviewerOverrides, resolveNotifyOnAllow } from "../auto-reviewer.ts";
 
 function tempDir(): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), "pi-reviewer-test-"));
@@ -89,4 +89,33 @@ test("autoReviewer object with non-string fields is ignored", () => {
     writeSettings(cwd, { autoReviewer: { provider: 42, model: "some-model" } });
     const r = resolveReviewerOverrides(cwd, true, {}, tempDir());
     assert.deepEqual(r, {});
+});
+
+test("allow notifications default on; only trusted settings can opt out", (t) => {
+    const cwd = tempDir();
+    const home = tempDir();
+    t.after(() => {
+        fs.rmSync(cwd, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    });
+    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), true);
+    for (const value of ["true", "1"]) {
+        assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: value }, home), true);
+    }
+    for (const value of ["false", "0"]) {
+        assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: value }, home), false);
+    }
+    assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: "typo" }, home), true);
+    writeSettings(cwd, { autoReviewer: { notifyOnAllow: false } });
+    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), true);
+    assert.equal(resolveNotifyOnAllow(cwd, true, {}, home), false);
+    assert.equal(resolveNotifyOnAllow(cwd, true, { PI_REVIEWER_NOTIFY_ON_ALLOW: "1" }, home), true);
+    fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".pi", "agent", "settings.json"),
+        JSON.stringify({ autoReviewer: { notifyOnAllow: false } }));
+    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), false);
+    writeSettings(cwd, { autoReviewer: { notifyOnAllow: true } });
+    assert.equal(resolveNotifyOnAllow(cwd, true, {}, home), true);
+    assert.equal(resolveNotifyOnAllow(cwd, true, { PI_REVIEWER_NOTIFY_ON_ALLOW: "0" }, home), false);
+    assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: "typo" }, home), false);
 });

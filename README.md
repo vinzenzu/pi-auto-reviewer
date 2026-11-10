@@ -12,7 +12,7 @@ Every shell command is routed into one of three tiers:
 
 | Tier | Action | Examples |
 |------|--------|----------|
-| **1. Auto-permitted** | Runs immediately | `ls`, `grep`, `git status`, `npm list` |
+| **1. Auto-permitted** | Runs immediately | `ls`, `grep`, `sort in.txt`, `git --version` |
 | **2. Auto-blocked** | Refused immediately | `rm -rf /`, `sudo`, `chmod 777`, `mkfs.*`, `shutdown` |
 | **3. Model-reviewed** | Sent to the configured reviewer | `git push --force`, `git reset --hard`, `rm -rf <dir>`, `Remove-Item -Recurse` |
 
@@ -79,7 +79,7 @@ Works automatically, no configuration required.
 - Tier 1 runs without visible delay.
 - Tier 2 is blocked with a notification explaining why.
 - Tier 3 handles destructive or unknown commands and pauses with `Reviewing: <command>...` (up to 60s per attempt, one automatic retry).
-  - Allowed: command runs, `Auto-reviewer: ✓ <reason>`
+  - Allowed: command runs, `Auto-reviewer: ✓ <reason>` (set `notifyOnAllow` to `false` for quiet mode)
   - Blocked: command refused, `Auto-reviewer: ✗ <reason>`
   - Reviewer failed twice: interactive mode prompts you manually; non-interactive mode (`pi -p`, JSON mode) blocks the command.
 
@@ -106,6 +106,42 @@ Or persistently via `autoReviewer` in `~/.pi/agent/settings.json` (user) or `.pi
 ```
 
 Provider and model resolve as a pair (env → trusted project → user → pi default); a layer specifying only one of the two is ignored entirely.
+
+
+### Allow notifications
+
+Allow notifications are enabled by default. To opt into quiet mode, set
+`autoReviewer.notifyOnAllow` to `false` in the user or trusted project settings:
+
+```json
+{ "autoReviewer": { "notifyOnAllow": false } }
+```
+
+Or set `PI_REVIEWER_NOTIFY_ON_ALLOW=false` (or `0`). Use `true` (or `1`) to
+explicitly enable notifications. Precedence is environment → trusted project
+→ user → enabled by default. Other environment values are ignored. Untrusted
+project settings cannot silence notifications. Blocks and failed reviews still
+notify in quiet mode. Review costs are still recorded and emitted; allow charge
+notifications are hidden in quiet mode.
+
+### Automatic permission checks
+
+Tier 1 accepts literal commands with checked arguments, pipelines whose stages
+all pass those checks, and stdout/stderr redirects to each other, closure, or
+an exact `/dev/null` target. Command chaining, backgrounding, newlines,
+expansions, unquoted globbing, and unsupported syntax or options require review.
+Unknown command forms, including other shell dialects, also require review.
+Previously permitted container/package-manager commands and PowerShell forms
+now require review because their arguments are not validated here. Git repository
+commands also require review: configuration can run helpers even for `git status`.
+Git context collection disables filesystem-monitor hooks and optional index
+writes, and skips submodule inspection.
+Ripgrep requires `--no-config` as its first argument, followed by checked options,
+to prevent configured preprocessors. Python's `-v` executes input and requires
+review; `--version` and `-V` can run immediately.
+`env` with a command, `find` execution/write/delete actions, `sort` output or
+compression options, and `uniq` with an output operand always require review.
+Repeated tier-3 commands receive a fresh review; approvals are not cached.
 
 
 ### Use Jev instead of an LLM
@@ -165,7 +201,7 @@ Tiers 1 and 2 are unchanged. Jev validates the choice, confidence, and probabili
 
 ## Customizing rules
 
-Edit `auto-reviewer.ts`: `AUTO_PERMITTED` / `AUTO_BLOCKED` for tier patterns, `defeatsAutoPermit()` and `SECRET_ENV_VAR` for what forces review, `analyzeCommand` and `buildReviewPrompt()` for behavior detection and the reviewer prompt.
+Edit `auto-reviewer.ts`: `READ_ONLY_OPTIONS`, `readOnlyCommand()`, and `readOnlyStages()` for automatic permission checks, `AUTO_BLOCKED` for hard blocks, `analyzeCommand` and `buildReviewPrompt()` for behavior detection and the reviewer prompt.
 
 ---
 
@@ -173,7 +209,7 @@ The `autoReviewer` settings support is based on [PR #2](https://github.com/vinze
 
 ## OpenRouter review costs
 
-Review results show the provider-confirmed charge, for example
+With allow notifications enabled, review results show the provider-confirmed charge, for example
 `Auto-reviewer: ✓ Read-only check · OpenRouter $0.003072`. Billing lookups run in the
 background. The result shows pending costs first when needed, followed by an
 updated notification once OpenRouter reports them. Billing never changes the

@@ -15,7 +15,7 @@ test('standalone Jev reviewer shows actual charges and persists native usage, in
   manager.appendMessage({ role: 'assistant', provider: 'fixture', model: 'fixture', api: 'openai-completions', content: [],
     timestamp: Date.now(), stopReason: 'stop', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
-  const keys = ['PI_REVIEWER_BACKEND', 'PI_REVIEWER_PROVIDER', 'PI_REVIEWER_MODEL', 'PI_REVIEWER_ENDPOINT', 'PI_REVIEWER_API_KEY_ENV'];
+  const keys = ['PI_REVIEWER_BACKEND', 'PI_REVIEWER_PROVIDER', 'PI_REVIEWER_MODEL', 'PI_REVIEWER_ENDPOINT', 'PI_REVIEWER_API_KEY_ENV', 'PI_REVIEWER_NOTIFY_ON_ALLOW'];
   const originalEnv = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
   for (const key of keys) delete process.env[key];
@@ -58,5 +58,59 @@ test('standalone Jev reviewer shows actual charges and persists native usage, in
   assert.ok(notifications.some(message => message.includes('Auto-reviewer: ✓') && message.includes('OpenRouter $0.010000')));
   assert.equal(events.filter(e => e.name === 'pi-auto-reviewer:cost' && e.data.status === 'confirmed').length, 2);
   assert.equal(SessionManager.open(manager.getSessionFile()!).getEntries().filter(e => e.type === 'usage').length, 2);
+  await handlers.get('session_shutdown')({}, ctx);
+});
+
+test('quiet mode preserves billing and block/failure notifications', async t => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-native-quiet-'));
+  const manager = SessionManager.create(cwd, path.join(cwd, 'sessions'));
+  manager.appendMessage({ role: 'user', content: 'Run the project tests.', timestamp: Date.now() });
+  manager.appendMessage({ role: 'assistant', provider: 'fixture', model: 'fixture', api: 'openai-completions', content: [],
+    timestamp: Date.now(), stopReason: 'stop', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+  const keys = ['PI_REVIEWER_BACKEND', 'PI_REVIEWER_PROVIDER', 'PI_REVIEWER_MODEL', 'PI_REVIEWER_ENDPOINT', 'PI_REVIEWER_API_KEY_ENV', 'PI_REVIEWER_NOTIFY_ON_ALLOW'];
+  const originalEnv = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const originalFetch = globalThis.fetch;
+  for (const key of keys) delete process.env[key];
+  Object.assign(process.env, { PI_REVIEWER_BACKEND: 'jev', PI_REVIEWER_PROVIDER: 'openrouter', PI_REVIEWER_MODEL: 'typesafe/jev', PI_REVIEWER_NOTIFY_ON_ALLOW: 'false' });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    for (const key of keys) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+  const handlers = new Map<string, any>();
+  const notifications: string[] = [];
+  extension({ on: (name: string, handler: any) => handlers.set(name, handler),
+    appendEntry: (type: string, data: unknown) => manager.appendCustomEntry(type, data),
+    events: { emit: () => {} },
+  } as any);
+  const ctx: any = { cwd, hasUI: true, sessionManager: manager, isProjectTrusted: () => false,
+    modelRegistry: { getApiKeyForProvider: async () => 'saved-key' },
+    ui: { notify: (message: string) => notifications.push(message), setStatus() {},
+      select: () => 'No' },
+  };
+  handlers.get('session_start')({}, ctx);
+  globalThis.fetch = async () => Response.json({
+    id: 'gen-quiet', model: 'typesafe/jev', usage: { cost: 0.003 },
+    answers: { command_review: { type: 'choice', choice: 'allow', confidence: 0.9, probabilities: { allow: 0.9, block: 0.1 } } }
+  });
+  assert.equal(await handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'review-quiet', input: { command: 'npm test' } }, ctx), undefined);
+  assert.equal(notifications.length, 0);
+  const billed = manager.getEntries().filter(e => e.type === 'usage');
+  assert.equal(billed.length, 1);
+  assert.equal(billed[0].usage.cost.total, 0.003);
+  assert.equal(SessionManager.open(manager.getSessionFile()!).getEntries().filter(e => e.type === 'usage').length, 1);
+  globalThis.fetch = async () => Response.json({ answers: { command_review: {
+    type: 'choice', choice: 'block', confidence: 0.9, probabilities: { allow: 0.1, block: 0.9 },
+  } } });
+  assert.equal((await handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'blocked', input: { command: 'git push' } }, ctx)).block, true);
+  assert.ok(notifications.some(message => message.includes('Auto-reviewer: ✗')));
+  globalThis.fetch = async () => Response.json({ answers: {} });
+  assert.equal((await handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'failed', input: { command: 'bash script.sh' } }, ctx)).block, true);
+  assert.ok(notifications.some(message => message.includes('Auto-review attempt 1 failed')));
+  assert.ok(notifications.some(message => message.includes('Auto-reviewer failed')));
   await handlers.get('session_shutdown')({}, ctx);
 });
