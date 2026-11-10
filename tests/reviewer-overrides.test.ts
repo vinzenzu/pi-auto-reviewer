@@ -91,20 +91,31 @@ test("autoReviewer object with non-string fields is ignored", () => {
     assert.deepEqual(r, {});
 });
 
-test("resolveNotifyOnAllow defaults to false, respects env and settings", () => {
+test("allow notifications default on; only trusted settings can opt out", (t) => {
     const cwd = tempDir();
     const home = tempDir();
-    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), false);
-    assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: "true" }, home), true);
-    assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: "false" }, home), false);
-    writeSettings(cwd, { autoReviewer: { notifyOnAllow: true } });
-    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), false); // untrusted
-    assert.equal(resolveNotifyOnAllow(cwd, true, {}, home), true); // trusted
-    writeSettings(path.join(home, ".pi", "agent"), { autoReviewer: { notifyOnAllow: true } });
+    t.after(() => {
+        fs.rmSync(cwd, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    });
+    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), true);
+    for (const value of ["true", "1"]) {
+        assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: value }, home), true);
+    }
+    for (const value of ["false", "0"]) {
+        assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: value }, home), false);
+    }
+    assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: "typo" }, home), true);
+    writeSettings(cwd, { autoReviewer: { notifyOnAllow: false } });
+    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), true);
+    assert.equal(resolveNotifyOnAllow(cwd, true, {}, home), false);
+    assert.equal(resolveNotifyOnAllow(cwd, true, { PI_REVIEWER_NOTIFY_ON_ALLOW: "1" }, home), true);
     fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
-    fs.writeFileSync(
-        path.join(home, ".pi", "agent", "settings.json"),
-        JSON.stringify({ autoReviewer: { notifyOnAllow: true } }),
-    );
-    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), true); // user settings
+    fs.writeFileSync(path.join(home, ".pi", "agent", "settings.json"),
+        JSON.stringify({ autoReviewer: { notifyOnAllow: false } }));
+    assert.equal(resolveNotifyOnAllow(cwd, false, {}, home), false);
+    writeSettings(cwd, { autoReviewer: { notifyOnAllow: true } });
+    assert.equal(resolveNotifyOnAllow(cwd, true, {}, home), true);
+    assert.equal(resolveNotifyOnAllow(cwd, true, { PI_REVIEWER_NOTIFY_ON_ALLOW: "0" }, home), false);
+    assert.equal(resolveNotifyOnAllow(cwd, false, { PI_REVIEWER_NOTIFY_ON_ALLOW: "typo" }, home), false);
 });

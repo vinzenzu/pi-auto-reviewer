@@ -86,7 +86,7 @@ test("the extension sends its policy, authorization, and quoted command to Jev",
     globalThis.fetch = async () => answer("block");
     assert.equal((await review("git reset --hard")).block, true);
     globalThis.fetch = async () => { throw new Error("tier must skip review"); };
-    assert.equal(await review("git status"), undefined);
+    assert.equal(await review("ls"), undefined);
     assert.equal((await review("sudo shutdown")).block, true);
 });
 
@@ -175,4 +175,20 @@ test("the extension uses a saved credential through Pi's real model registry", a
     };
     assert.equal(await review("npm test"), undefined);
     assert.equal(JSON.parse(fs.readFileSync(authPath, "utf8")).openrouter.key, "fixture-saved-key");
+});
+
+
+test("review includes file-write semantics and explicit user restrictions", async t => {
+    const review = install(t, fixture(t));
+    let state = "";
+    globalThis.fetch = async (_url, init) => {
+        state = JSON.parse(String(init?.body)).state;
+        return answer("block");
+    };
+    const result = await review("uniq input.txt protected.txt");
+    assert.equal(result.block, true);
+    assert.match(result.reason, /Auto-reviewer blocked/);
+    assert.match(state, /uniq INPUT OUTPUT overwrites OUTPUT/);
+    assert.match(state, /Explicit user restrictions override the general ALLOW rules/);
+    assert.match(state, /uniq input.txt protected.txt/);
 });

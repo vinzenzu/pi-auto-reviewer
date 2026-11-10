@@ -19,7 +19,7 @@ test('standalone Jev reviewer shows actual charges and persists native usage, in
   const originalEnv = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
   for (const key of keys) delete process.env[key];
-  Object.assign(process.env, { PI_REVIEWER_BACKEND: 'jev', PI_REVIEWER_PROVIDER: 'openrouter', PI_REVIEWER_MODEL: 'typesafe/jev', PI_REVIEWER_NOTIFY_ON_ALLOW: 'true' });
+  Object.assign(process.env, { PI_REVIEWER_BACKEND: 'jev', PI_REVIEWER_PROVIDER: 'openrouter', PI_REVIEWER_MODEL: 'typesafe/jev' });
   t.after(() => {
     globalThis.fetch = originalFetch;
     for (const key of keys) {
@@ -61,7 +61,7 @@ test('standalone Jev reviewer shows actual charges and persists native usage, in
   await handlers.get('session_shutdown')({}, ctx);
 });
 
-test('allowed commands do not notify by default', async t => {
+test('quiet mode preserves billing and block/failure notifications', async t => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-native-quiet-'));
   const manager = SessionManager.create(cwd, path.join(cwd, 'sessions'));
   manager.appendMessage({ role: 'user', content: 'Run the project tests.', timestamp: Date.now() });
@@ -72,7 +72,7 @@ test('allowed commands do not notify by default', async t => {
   const originalEnv = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
   for (const key of keys) delete process.env[key];
-  Object.assign(process.env, { PI_REVIEWER_BACKEND: 'jev', PI_REVIEWER_PROVIDER: 'openrouter', PI_REVIEWER_MODEL: 'typesafe/jev' });
+  Object.assign(process.env, { PI_REVIEWER_BACKEND: 'jev', PI_REVIEWER_PROVIDER: 'openrouter', PI_REVIEWER_MODEL: 'typesafe/jev', PI_REVIEWER_NOTIFY_ON_ALLOW: 'false' });
   t.after(() => {
     globalThis.fetch = originalFetch;
     for (const key of keys) {
@@ -90,14 +90,27 @@ test('allowed commands do not notify by default', async t => {
   const ctx: any = { cwd, hasUI: true, sessionManager: manager, isProjectTrusted: () => false,
     modelRegistry: { getApiKeyForProvider: async () => 'saved-key' },
     ui: { notify: (message: string) => notifications.push(message), setStatus() {},
-      select: () => { throw new Error('Unexpected approval prompt'); } },
+      select: () => 'No' },
   };
   handlers.get('session_start')({}, ctx);
   globalThis.fetch = async () => Response.json({
-    id: 'gen-quiet', model: 'typesafe/jev',
+    id: 'gen-quiet', model: 'typesafe/jev', usage: { cost: 0.003 },
     answers: { command_review: { type: 'choice', choice: 'allow', confidence: 0.9, probabilities: { allow: 0.9, block: 0.1 } } }
   });
   assert.equal(await handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'review-quiet', input: { command: 'npm test' } }, ctx), undefined);
   assert.equal(notifications.length, 0);
+  const billed = manager.getEntries().filter(e => e.type === 'usage');
+  assert.equal(billed.length, 1);
+  assert.equal(billed[0].usage.cost.total, 0.003);
+  assert.equal(SessionManager.open(manager.getSessionFile()!).getEntries().filter(e => e.type === 'usage').length, 1);
+  globalThis.fetch = async () => Response.json({ answers: { command_review: {
+    type: 'choice', choice: 'block', confidence: 0.9, probabilities: { allow: 0.1, block: 0.9 },
+  } } });
+  assert.equal((await handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'blocked', input: { command: 'git push' } }, ctx)).block, true);
+  assert.ok(notifications.some(message => message.includes('Auto-reviewer: ✗')));
+  globalThis.fetch = async () => Response.json({ answers: {} });
+  assert.equal((await handlers.get('tool_call')({ toolName: 'bash', toolCallId: 'failed', input: { command: 'bash script.sh' } }, ctx)).block, true);
+  assert.ok(notifications.some(message => message.includes('Auto-review attempt 1 failed')));
+  assert.ok(notifications.some(message => message.includes('Auto-reviewer failed')));
   await handlers.get('session_shutdown')({}, ctx);
 });
