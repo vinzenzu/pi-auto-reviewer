@@ -108,6 +108,46 @@ Or persistently via `autoReviewer` in `~/.pi/agent/settings.json` (user) or `.pi
 Provider and model resolve as a pair (env → trusted project → user → pi default); a layer specifying only one of the two is ignored entirely.
 
 
+### Handling a denied command
+
+Set `autoReviewer.onDeny` in user or trusted project settings:
+
+```json
+{ "autoReviewer": { "onDeny": "agent" } }
+```
+
+Or set `PI_REVIEWER_ON_DENY=agent` for one launch. The modes are:
+
+| Value | After the reviewer rejects a command |
+| --- | --- |
+| `block` (default) | Return the existing blocked-tool error. |
+| `agent` | Return a blocked-tool error with guidance to inspect the rejection and choose a permitted next step. |
+| `manual` | Ask the operator to allow the displayed command once or block it. Without a UI, or on cancellation, keep it blocked. |
+
+No denied command executes in `block` or `agent` mode. In `manual` mode,
+only an explicit **Allow once** permits that invocation. Hard blocks cannot
+be overridden by these settings. Reviewer API failures retain their existing
+manual fallback behavior.
+
+The setting resolves independently of the provider/model pair:
+environment → trusted project → user → `block`. An invalid value selects
+`block`. Untrusted project settings are ignored. Use a launch-scoped
+environment variable to limit this choice to a sandbox session.
+
+`agent` mode does not grant permission to evade a refusal. The agent may
+gather new evidence or choose a permitted alternative; retrying the denied
+operation requires resolving the concern with evidence or explicit user
+authorization. Do not replace a rejected command with another way of
+performing the same unauthorized operation.
+
+By default, Pi receives the tool error and decides its next step. Extensions
+that pause after denials must explicitly support recovery. The reviewer emits
+`pi-auto-reviewer:denial` on `pi.events` for each final model denial, with
+`sessionId`, `toolCallId`, and `handling`. A continuation extension must match
+both IDs and honor only `handling: "agent"`; shell output is not policy
+metadata. Manual approvals emit no denial event. Hard blocks do not emit
+recovery metadata.
+
 ### Allow notifications
 
 Allow notifications are enabled by default. To opt into quiet mode, set

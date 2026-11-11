@@ -85,28 +85,51 @@ const DEBUG_KEEP = 20;
 // settings. Without this, an untrusted repository could influence which
 // model performs the security review.
 
+export type DenialHandling = "block" | "manual" | "agent";
+
 interface ReviewerOverrides extends JevConfig {
     backend?: string;
 }
 
 // Read the extension-specific reviewer overrides from one settings file.
 // Malformed JSON or a missing autoReviewer object must never break review.
-function readReviewerSettingsFile(filePath: string): ReviewerOverrides {
+function readAutoReviewerSettings(filePath: string): Record<string, unknown> | undefined {
     try {
-        if (!fs.existsSync(filePath)) return {};
+        if (!fs.existsSync(filePath)) return undefined;
         const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
-        if (!parsed || typeof parsed !== "object") return {};
+        if (!parsed || typeof parsed !== "object") return undefined;
         const value = (parsed as Record<string, unknown>).autoReviewer;
-        if (!value || typeof value !== "object") return {};
-        const config = value as Record<string, unknown>;
-        return {
-            ...readBackendSettings(config),
-            provider: typeof config.provider === "string" ? config.provider.trim() || undefined : undefined,
-            model: typeof config.model === "string" ? config.model.trim() || undefined : undefined,
-        };
+        return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
     } catch {
-        return {};
+        return undefined;
     }
+}
+
+function readReviewerSettingsFile(filePath: string): ReviewerOverrides {
+    const config = readAutoReviewerSettings(filePath);
+    if (!config) return {};
+    return {
+        ...readBackendSettings(config),
+        provider: typeof config.provider === "string" ? config.provider.trim() || undefined : undefined,
+        model: typeof config.model === "string" ? config.model.trim() || undefined : undefined,
+    };
+}
+
+export function resolveDenialHandling(
+    cwd: string,
+    isProjectTrusted: boolean,
+    env: NodeJS.ProcessEnv = process.env,
+    homeDir: string = os.homedir(),
+): DenialHandling {
+    const parse = (value: unknown): DenialHandling =>
+        value === "agent" || value === "manual" ? value : "block";
+    if (env.PI_REVIEWER_ON_DENY !== undefined) return parse(env.PI_REVIEWER_ON_DENY);
+    if (isProjectTrusted) {
+        const project = readAutoReviewerSettings(path.join(cwd, CONFIG_DIR_NAME, "settings.json"));
+        if (project && Object.hasOwn(project, "onDeny")) return parse(project.onDeny);
+    }
+    const user = readAutoReviewerSettings(path.join(homeDir, ".pi", "agent", "settings.json"));
+    return parse(user?.onDeny);
 }
 
 // Keep transport configuration in the same precedence layer as provider/model.
@@ -1626,7 +1649,29 @@ export default function (pi: ExtensionAPI) {
                     return undefined; // allow through
                 } else {
                     showResult(`Auto-reviewer: ✗ ${decision.reason}`, "warning");
-                    return { block: true, reason: `Auto-reviewer blocked: ${decision.reason}` };
+                    const handling = resolveDenialHandling(ctx.cwd, projectTrusted);
+                    if (handling === "manual" && ctx.hasUI) {
+                        let allowedOnce = false;
+                        try {
+                            allowedOnce = await ctx.ui.select(
+                                `Auto-reviewer denied: ${decision.reason}\n\nCommand: ${command}\n\nAllow this command once?`,
+                                ["Block", "Allow once"],
+                            ) === "Allow once";
+                        } catch {
+                            // A cancelled or unavailable confirmation remains a denial.
+                        }
+                        if (allowedOnce && !ctx.signal?.aborted) {
+                            showResult("Auto-reviewer: operator allowed this command once after denial", "info");
+                            return undefined;
+                        }
+                    }
+                    pi.events.emit("pi-auto-reviewer:denial", {
+                        sessionId: parentSessionId, toolCallId: event.toolCallId, handling,
+                    });
+                    const feedback = handling === "agent"
+                        ? "\nThe command was not executed. Inspect the rejection and choose a permitted next step. Retry this operation only if new evidence or explicit user authorization resolves the concern. A safer alternative must not disguise the same denied operation. Do not blindly repeat the command."
+                        : "";
+                    return { block: true, reason: `Auto-reviewer blocked: ${decision.reason}${feedback}` };
                 }
             } catch (err) {
                 lastError = err instanceof Error ? err : new Error(String(err));

@@ -54,7 +54,7 @@ function install(t: any, cwd: string, getProviderApiKey = async (_provider: stri
         }
     });
     let handler: any;
-    extension({ on(name: string, callback: any) { if (name === "tool_call") handler = callback; } } as any);
+    extension({ events: { emit() {} }, on(name: string, callback: any) { if (name === "tool_call") handler = callback; } } as any);
     return command => handler({ toolName: "bash", input: { command }, toolCallId: "pending" }, {
         cwd, hasUI: false, isProjectTrusted: () => false,
         modelRegistry: { getApiKeyForProvider: getProviderApiKey },
