@@ -86,6 +86,10 @@ const DEBUG_KEEP = 20;
 // model performs the security review.
 
 export type DenialHandling = "block" | "manual" | "agent";
+export type ReviewFailureHandling = "ask" | "follow-onDeny";
+
+const REFUSAL_GUIDANCE = "\nThe command was not executed. Inspect the rejection and choose a permitted next step. Retry this operation only if new evidence or explicit user authorization resolves the concern. A safer alternative must not disguise the same denied operation. Do not blindly repeat the command.";
+const FAILURE_GUIDANCE = "\nThe reviewer could not be reached, so the command was not reviewed or executed. Do not treat this as a safety judgment. Continue with work that does not need this command, or ask the user how to proceed. Do not rephrase the command to get around review.";
 
 interface ReviewerOverrides extends JevConfig {
     backend?: string;
@@ -115,21 +119,42 @@ function readReviewerSettingsFile(filePath: string): ReviewerOverrides {
     };
 }
 
+function resolveAutoReviewerChoice<T>(
+    cwd: string,
+    isProjectTrusted: boolean,
+    env: NodeJS.ProcessEnv,
+    homeDir: string,
+    envName: string,
+    settingsKey: string,
+    parse: (value: unknown) => T,
+): T {
+    if (env[envName] !== undefined) return parse(env[envName]);
+    if (isProjectTrusted) {
+        const project = readAutoReviewerSettings(path.join(cwd, CONFIG_DIR_NAME, "settings.json"));
+        if (project && Object.hasOwn(project, settingsKey)) return parse(project[settingsKey]);
+    }
+    const user = readAutoReviewerSettings(path.join(homeDir, ".pi", "agent", "settings.json"));
+    return parse(user?.[settingsKey]);
+}
+
 export function resolveDenialHandling(
     cwd: string,
     isProjectTrusted: boolean,
     env: NodeJS.ProcessEnv = process.env,
     homeDir: string = os.homedir(),
 ): DenialHandling {
-    const parse = (value: unknown): DenialHandling =>
-        value === "agent" || value === "manual" ? value : "block";
-    if (env.PI_REVIEWER_ON_DENY !== undefined) return parse(env.PI_REVIEWER_ON_DENY);
-    if (isProjectTrusted) {
-        const project = readAutoReviewerSettings(path.join(cwd, CONFIG_DIR_NAME, "settings.json"));
-        if (project && Object.hasOwn(project, "onDeny")) return parse(project.onDeny);
-    }
-    const user = readAutoReviewerSettings(path.join(homeDir, ".pi", "agent", "settings.json"));
-    return parse(user?.onDeny);
+    return resolveAutoReviewerChoice(cwd, isProjectTrusted, env, homeDir, "PI_REVIEWER_ON_DENY", "onDeny",
+        value => value === "block" || value === "manual" ? value : "agent");
+}
+
+export function resolveReviewFailureHandling(
+    cwd: string,
+    isProjectTrusted: boolean,
+    env: NodeJS.ProcessEnv = process.env,
+    homeDir: string = os.homedir(),
+): ReviewFailureHandling {
+    return resolveAutoReviewerChoice(cwd, isProjectTrusted, env, homeDir, "PI_REVIEWER_ON_REVIEW_FAILURE", "onReviewFailure",
+        value => value === "follow-onDeny" ? "follow-onDeny" : "ask");
 }
 
 // Keep transport configuration in the same precedence layer as provider/model.
@@ -1623,6 +1648,47 @@ export default function (pi: ExtensionAPI) {
             if (costs.summary().pending === 0) billingTrackers.delete(costs);
         };
 
+        const finishStopped = async (input: {
+            cause: "denied" | "failed";
+            handling: DenialHandling;
+            title: string;
+            blockReason: string;
+            agentFeedback: string;
+            askOperator: boolean;
+        }): Promise<{ block: true; reason: string; terminate?: true } | undefined> => {
+            if (input.askOperator && ctx.hasUI && !ctx.signal?.aborted) {
+                let allowedOnce = false;
+                try {
+                    allowedOnce = await ctx.ui.select(
+                        `${input.title}\n\nCommand: ${command}\n\nAllow this command once?`,
+                        ["Block", "Allow once"],
+                    ) === "Allow once";
+                } catch {
+                    // A cancelled or closed dialog counts as Block.
+                }
+                if (allowedOnce && !ctx.signal?.aborted) {
+                    const after = input.cause === "denied" ? "denial" : "a failed review";
+                    showResult(`Auto-reviewer: operator allowed this command once after ${after}`, "info");
+                    return undefined;
+                }
+            }
+            if (input.handling === "agent") {
+                try {
+                    pi.events.emit("pi-auto-reviewer:denial", {
+                        sessionId: parentSessionId,
+                        toolCallId: event.toolCallId,
+                        handling: "agent",
+                        cause: input.cause,
+                    });
+                } catch {
+                    // Delivery failure must not reopen review or a dialog.
+                }
+            }
+            const reason = input.blockReason + (input.handling === "agent" ? input.agentFeedback : "");
+            if (input.handling === "agent") return { block: true, reason };
+            return { block: true, reason, terminate: true };
+        };
+
         let denied: { reason: string } | undefined;
         for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
             try {
@@ -1655,61 +1721,47 @@ export default function (pi: ExtensionAPI) {
                 break;
             } catch (err) {
                 lastError = err instanceof Error ? err : new Error(String(err));
+                if (ctx.signal?.aborted) break;
                 if (ctx.hasUI && attempt < MAX_REVIEW_ATTEMPTS) {
                     ctx.ui.notify(`Auto-review attempt ${attempt} failed: ${lastError.message.split("\n")[0].slice(0, 150)}`, "warning");
                 }
             }
         }
 
+        const handling = resolveDenialHandling(ctx.cwd, projectTrusted);
         if (denied) {
             showResult(`Auto-reviewer: ✗ ${denied.reason}`, "warning");
-            const handling = resolveDenialHandling(ctx.cwd, projectTrusted);
-            if (handling === "manual" && ctx.hasUI) {
-                let allowedOnce = false;
-                try {
-                    allowedOnce = await ctx.ui.select(
-                        `Auto-reviewer denied: ${denied.reason}\n\nCommand: ${command}\n\nAllow this command once?`,
-                        ["Block", "Allow once"],
-                    ) === "Allow once";
-                } catch {
-                    // A cancelled or unavailable confirmation remains a denial.
-                }
-                if (allowedOnce && !ctx.signal?.aborted) {
-                    showResult("Auto-reviewer: operator allowed this command once after denial", "info");
-                    return undefined;
-                }
-            }
-            try {
-                pi.events.emit("pi-auto-reviewer:denial", {
-                    sessionId: parentSessionId, toolCallId: event.toolCallId, handling,
-                });
-            } catch {
-                // Delivery failure must not reopen review or the failure Allow dialog.
-            }
-            const feedback = handling === "agent"
-                ? "\nThe command was not executed. Inspect the rejection and choose a permitted next step. Retry this operation only if new evidence or explicit user authorization resolves the concern. A safer alternative must not disguise the same denied operation. Do not blindly repeat the command."
-                : "";
-            return { block: true, reason: `Auto-reviewer blocked: ${denied.reason}${feedback}` };
+            return finishStopped({
+                cause: "denied",
+                handling,
+                title: `Auto-reviewer denied: ${denied.reason}`,
+                blockReason: `Auto-reviewer blocked: ${denied.reason}`,
+                agentFeedback: REFUSAL_GUIDANCE,
+                askOperator: handling === "manual",
+            });
         }
 
         if (ctx.hasUI) ctx.ui.setStatus("auto-reviewer", undefined);
 
-        showResult(`Auto-reviewer failed: ${lastError!.message.split("\n")[0].slice(0, 150)}`, "warning");
-
-        if (ctx.hasUI) {
-            // All attempts failed — fall back to manual UI
-            const msg = lastError!.message;
-            const choice = await ctx.ui.select(
-                `⚠️  Auto-review failed (${MAX_REVIEW_ATTEMPTS} attempts): ${msg}\n\nCommand: ${command}\n\nAllow?`,
-                ["Yes", "No"],
-            );
-            if (choice !== "Yes") {
-                return { block: true, reason: "Auto-review failed and user declined" };
-            }
-            return undefined;
+        // Esc aborts the review. That is a cancellation, not a failed review,
+        // so the agent must not be told to continue the cancelled work.
+        if (ctx.signal?.aborted) {
+            reviewCompleted = true;
+            if (costs.summary().pending === 0) billingTrackers.delete(costs);
+            return { block: true, reason: "Auto-review cancelled. The command was not executed." };
         }
 
-        return { block: true, reason: `Auto-review failed (${MAX_REVIEW_ATTEMPTS} attempts): ${lastError!.message}` };
+        const errorLine = lastError!.message.split("\n")[0].slice(0, 150);
+        showResult(`Auto-reviewer failed: ${errorLine}`, "warning");
+        const failureHandling = resolveReviewFailureHandling(ctx.cwd, projectTrusted);
+        return finishStopped({
+            cause: "failed",
+            handling,
+            title: `Auto-review failed (${MAX_REVIEW_ATTEMPTS} attempts): ${errorLine}`,
+            blockReason: `Auto-review failed (${MAX_REVIEW_ATTEMPTS} attempts): ${errorLine}. The command was not executed.`,
+            agentFeedback: FAILURE_GUIDANCE,
+            askOperator: handling === "manual" || (handling === "block" && failureHandling === "ask"),
+        });
     });
 
     // Clean up status on session end
