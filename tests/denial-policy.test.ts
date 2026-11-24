@@ -11,7 +11,7 @@ function fixture(t: any): string {
     return dir;
 }
 
-function configuredReview(t: any, mode: string, options: { hasUI?: boolean; choice?: string; cancel?: boolean; aborted?: boolean } = {}) {
+function configuredReview(t: any, mode: string, options: { hasUI?: boolean; choice?: string; cancel?: boolean; aborted?: boolean; takeFirstChoice?: boolean; denialEmitThrows?: boolean; allowOnRetry?: boolean } = {}) {
     const cwd = fixture(t);
     const keys = ["PI_REVIEWER_PROVIDER", "PI_REVIEWER_MODEL", "PI_REVIEWER_BACKEND", "PI_REVIEWER_ENDPOINT", "PI_REVIEWER_API_KEY_ENV", "PI_REVIEWER_ON_DENY", "TYPESAFE_API_KEY"];
     const original = Object.fromEntries(keys.map(key => [key, process.env[key]]));
@@ -31,13 +31,19 @@ function configuredReview(t: any, mode: string, options: { hasUI?: boolean; choi
     const handlers = new Map<string, any>();
     globalThis.fetch = async () => {
         requests++;
+        const choice = options.allowOnRetry && requests > 1 ? "allow" : "block";
+        const allow = choice === "allow";
         return Response.json({ answers: { command_review: {
-            type: "choice", choice: "block", probabilities: { allow: 0.1, block: 0.9 }, confidence: 0.9,
+            type: "choice", choice, confidence: 0.9,
+            probabilities: allow ? { allow: 0.9, block: 0.1 } : { allow: 0.1, block: 0.9 },
         } } });
     };
     reviewer.default({
         on: (name: string, handler: any) => handlers.set(name, handler),
-        appendEntry() {}, events: { emit: (name: string, data: any) => events.push({ name, data }) },
+        appendEntry() {}, events: { emit: (name: string, data: any) => {
+            events.push({ name, data });
+            if (options.denialEmitThrows && name === "pi-auto-reviewer:denial") throw new Error("denial delivery failed");
+        } },
     } as any);
     const controller = new AbortController();
     const ctx: any = {
@@ -49,6 +55,7 @@ function configuredReview(t: any, mode: string, options: { hasUI?: boolean; choi
             prompts.push({ title, choices });
             if (options.aborted) controller.abort();
             if (options.cancel) throw new Error("dialog cancelled");
+            if (options.takeFirstChoice) return choices[0];
             return options.choice;
         } },
     };
@@ -115,6 +122,15 @@ test("hard blocks cannot be overridden by manual mode", async t => {
     assert.match(result.reason, /Auto-blocked/);
     assert.equal(h.requests, 0);
     assert.equal(h.prompts.length, 0);
+});
+
+test("a denial delivery failure stays blocked and does not open the failure Allow dialog", async t => {
+    const h = configuredReview(t, "manual", { hasUI: true, takeFirstChoice: true, denialEmitThrows: true, allowOnRetry: true });
+    const result = await h.review();
+    assert.equal(result.block, true);
+    assert.match(result.reason, /^Auto-reviewer blocked:/);
+    assert.equal(h.requests, 1);
+    assert.deepEqual(h.prompts.map(prompt => prompt.choices), [["Block", "Allow once"]]);
 });
 
 test("block mode preserves the existing denial behavior", async t => {

@@ -1623,6 +1623,7 @@ export default function (pi: ExtensionAPI) {
             if (costs.summary().pending === 0) billingTrackers.delete(costs);
         };
 
+        let denied: { reason: string } | undefined;
         for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
             try {
                 if (ctx.hasUI) {
@@ -1647,38 +1648,48 @@ export default function (pi: ExtensionAPI) {
                 if (decision.allowed) {
                     showResult(`Auto-reviewer: ✓ ${decision.reason}`, "info");
                     return undefined; // allow through
-                } else {
-                    showResult(`Auto-reviewer: ✗ ${decision.reason}`, "warning");
-                    const handling = resolveDenialHandling(ctx.cwd, projectTrusted);
-                    if (handling === "manual" && ctx.hasUI) {
-                        let allowedOnce = false;
-                        try {
-                            allowedOnce = await ctx.ui.select(
-                                `Auto-reviewer denied: ${decision.reason}\n\nCommand: ${command}\n\nAllow this command once?`,
-                                ["Block", "Allow once"],
-                            ) === "Allow once";
-                        } catch {
-                            // A cancelled or unavailable confirmation remains a denial.
-                        }
-                        if (allowedOnce && !ctx.signal?.aborted) {
-                            showResult("Auto-reviewer: operator allowed this command once after denial", "info");
-                            return undefined;
-                        }
-                    }
-                    pi.events.emit("pi-auto-reviewer:denial", {
-                        sessionId: parentSessionId, toolCallId: event.toolCallId, handling,
-                    });
-                    const feedback = handling === "agent"
-                        ? "\nThe command was not executed. Inspect the rejection and choose a permitted next step. Retry this operation only if new evidence or explicit user authorization resolves the concern. A safer alternative must not disguise the same denied operation. Do not blindly repeat the command."
-                        : "";
-                    return { block: true, reason: `Auto-reviewer blocked: ${decision.reason}${feedback}` };
                 }
+                // A rejection is final. Finish it outside this try so a
+                // notification or event error cannot start another review.
+                denied = decision;
+                break;
             } catch (err) {
                 lastError = err instanceof Error ? err : new Error(String(err));
                 if (ctx.hasUI && attempt < MAX_REVIEW_ATTEMPTS) {
                     ctx.ui.notify(`Auto-review attempt ${attempt} failed: ${lastError.message.split("\n")[0].slice(0, 150)}`, "warning");
                 }
             }
+        }
+
+        if (denied) {
+            showResult(`Auto-reviewer: ✗ ${denied.reason}`, "warning");
+            const handling = resolveDenialHandling(ctx.cwd, projectTrusted);
+            if (handling === "manual" && ctx.hasUI) {
+                let allowedOnce = false;
+                try {
+                    allowedOnce = await ctx.ui.select(
+                        `Auto-reviewer denied: ${denied.reason}\n\nCommand: ${command}\n\nAllow this command once?`,
+                        ["Block", "Allow once"],
+                    ) === "Allow once";
+                } catch {
+                    // A cancelled or unavailable confirmation remains a denial.
+                }
+                if (allowedOnce && !ctx.signal?.aborted) {
+                    showResult("Auto-reviewer: operator allowed this command once after denial", "info");
+                    return undefined;
+                }
+            }
+            try {
+                pi.events.emit("pi-auto-reviewer:denial", {
+                    sessionId: parentSessionId, toolCallId: event.toolCallId, handling,
+                });
+            } catch {
+                // Delivery failure must not reopen review or the failure Allow dialog.
+            }
+            const feedback = handling === "agent"
+                ? "\nThe command was not executed. Inspect the rejection and choose a permitted next step. Retry this operation only if new evidence or explicit user authorization resolves the concern. A safer alternative must not disguise the same denied operation. Do not blindly repeat the command."
+                : "";
+            return { block: true, reason: `Auto-reviewer blocked: ${denied.reason}${feedback}` };
         }
 
         if (ctx.hasUI) ctx.ui.setStatus("auto-reviewer", undefined);
