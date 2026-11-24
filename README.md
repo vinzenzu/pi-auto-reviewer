@@ -81,7 +81,7 @@ Works automatically, no configuration required.
 - Tier 3 handles destructive or unknown commands and pauses with `Reviewing: <command>...` (up to 60s per attempt, one automatic retry).
   - Allowed: command runs, `Auto-reviewer: ✓ <reason>` (set `notifyOnAllow` to `false` for quiet mode)
   - Blocked: command refused, `Auto-reviewer: ✗ <reason>`
-  - Reviewer failed twice: interactive mode prompts you manually; non-interactive mode (`pi -p`, JSON mode) blocks the command.
+  - Reviewer failed twice: see *Handling a failed review*. By default (`agent` mode), the command is skipped and the agent continues with guidance. In `block` (with `onReviewFailure: "ask"`) and `manual` mode, interactive sessions ask **Block** / **Allow once**, with Block as the default choice.
 
 Each review attempt writes the command and full reviewer output to the OS temporary directory under `pi-reviewer-debug/` (`/tmp/pi-reviewer-debug/` on typical Linux systems). The newest 20 files are kept. Jev failures log the error message rather than provider error bodies.
 
@@ -113,25 +113,25 @@ Provider and model resolve as a pair (env → trusted project → user → pi de
 Set `autoReviewer.onDeny` in user or trusted project settings:
 
 ```json
-{ "autoReviewer": { "onDeny": "agent" } }
+{ "autoReviewer": { "onDeny": "block" } }
 ```
 
-Or set `PI_REVIEWER_ON_DENY=agent` for one launch. The modes are:
+Or set `PI_REVIEWER_ON_DENY=block` for one launch. The modes are:
 
 | Value | After the reviewer rejects a command |
 | --- | --- |
-| `block` (default) | Return the existing blocked-tool error. |
-| `agent` | Return a blocked-tool error with guidance to inspect the rejection and choose a permitted next step. |
-| `manual` | Ask the operator to allow the displayed command once or block it. Without a UI, or on cancellation, keep it blocked. |
+| `agent` (default) | Return the error so the agent continues with guidance. |
+| `block` | Stop the agent's turn; the command does not run. |
+| `manual` | Ask the operator; Block stops the turn. Without a UI, or on cancellation, keep it blocked and stop the turn. |
 
 No denied command executes in `block` or `agent` mode. In `manual` mode,
-only an explicit **Allow once** permits that invocation. Hard blocks cannot
-be overridden by these settings. Reviewer API failures retain their existing
-manual fallback behavior.
+only an explicit **Allow once** permits that invocation. **Block** is the
+first choice, so Enter stops the turn. Hard blocks cannot be overridden by
+these settings. A failed review follows *Handling a failed review*.
 
 The setting resolves independently of the provider/model pair:
-environment → trusted project → user → `block`. An invalid value selects
-`block`. Untrusted project settings are ignored. Use a launch-scoped
+environment → trusted project → user → `agent`. An invalid value selects
+`agent`. Untrusted project settings are ignored. Use a launch-scoped
 environment variable to limit this choice to a sandbox session.
 
 `agent` mode does not grant permission to evade a refusal. The agent may
@@ -140,13 +140,47 @@ operation requires resolving the concern with evidence or explicit user
 authorization. Do not replace a rejected command with another way of
 performing the same unauthorized operation.
 
-By default, Pi receives the tool error and decides its next step. Extensions
-that pause after denials must explicitly support recovery. The reviewer emits
-`pi-auto-reviewer:denial` on `pi.events` for each final model denial, with
-`sessionId`, `toolCallId`, and `handling`. A continuation extension must match
-both IDs and honor only `handling: "agent"`; shell output is not policy
-metadata. Manual approvals emit no denial event. Hard blocks do not emit
-recovery metadata.
+In `agent` mode, Pi receives the tool error and decides its next step. In
+`block` and `manual` mode, a stopped command ends the turn. Pi stops the
+turn only when every tool call in that model response asks to stop. If a
+parallel call ran normally, the model gets one more step, sees this error,
+and the next stopped call ends the turn. **Allow once** runs that one
+command and the turn continues.
+
+The reviewer emits `pi-auto-reviewer:denial` on `pi.events` only when the
+mode is `agent` and the command stayed stopped. The payload is `sessionId`,
+`toolCallId`, `handling: "agent"`, and `cause`. `cause: "denied"` means the
+reviewer refused the command. `cause: "failed"` means the reviewer did not
+answer; that is not a safety judgment. Earlier versions emitted this event
+for every stopped command and had no `cause`. A continuation extension must
+match both IDs. Manual **Block**, `block` mode, and **Allow once** emit no
+denial event. Hard blocks do not emit recovery metadata.
+
+### Handling a failed review
+
+Set `autoReviewer.onReviewFailure` when a review cannot get an answer
+(network error, timeout, or a bad response). It does not apply to a refusal.
+
+```json
+{ "autoReviewer": { "onReviewFailure": "ask" } }
+```
+
+Or set `PI_REVIEWER_ON_REVIEW_FAILURE` for one launch. `ask` is the default.
+`follow-onDeny` uses the same stop-or-continue choice as `onDeny`. An invalid
+value selects `ask`. Precedence is environment → trusted project → user →
+`ask`. Untrusted project settings are ignored. The setting only changes
+`block` mode: `manual` always asks, and `agent` never does.
+
+| `onDeny` | Reviewer refuses | Reviewer fails, `ask` (default) | Reviewer fails, `follow-onDeny` |
+| --- | --- | --- | --- |
+| `agent` (default) | Agent continues, with refusal guidance. Event `cause: "denied"`. | Agent continues, with failure guidance. Event `cause: "failed"`. | Same as `ask`. |
+| `block` | Turn stops. | Interactive session asks **Block** / **Allow once**. Block stops the turn. | Turn stops. |
+| `manual` | Interactive session asks. Block stops the turn. | Interactive session asks. Block stops the turn. | Interactive session asks. Block stops the turn. |
+
+Without a UI, `block` and `manual` stop the turn, and `agent` lets the agent
+continue. A cancelled or closed dialog counts as Block. If the turn is already
+aborted, no dialog is shown and the command stays stopped. **Allow once** runs
+that one command.
 
 ### Allow notifications
 
@@ -237,7 +271,7 @@ The presets use TypeSafe’s [`/v1/systemone`](https://docs.typesafe.ai/api) and
 
 All reviewer options follow the provider/model pair’s precedence: env → trusted project → user. Include `backend` in that same layer. A complete environment pair replaces settings-file options; incomplete pairs and untrusted project settings are ignored. Omit `backend` or set it to `"pi"` to use the LLM reviewer; unknown backend names fail review.
 
-Tiers 1 and 2 are unchanged. Jev validates the choice, confidence, and probability distribution; malformed, inconsistent, or tied answers fail review. There is no additional confidence threshold. The existing 60-second deadline, one retry, and manual-prompt/noninteractive-block fallback apply.
+Tiers 1 and 2 are unchanged. Jev validates the choice, confidence, and probability distribution; malformed, inconsistent, or tied answers fail review. There is no additional confidence threshold. The existing 60-second deadline and one retry apply. A failed review then follows *Handling a failed review*.
 
 ## Customizing rules
 
